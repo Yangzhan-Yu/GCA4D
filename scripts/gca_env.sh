@@ -23,9 +23,13 @@ export NUMBA_CACHE_DIR="$GCA_RUNTIME_CACHE/numba"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONPYCACHEPREFIX="$GCA_RUNTIME_CACHE/pycache"
 
-# SAM3 code and optional checkpoint. Weights are intentionally not tracked.
+# SAM3 code, checkpoint and interpreter.  SAM3 needs torch>=2.7, while the
+# gca env pins torch 2.5, so SAM3 runs in its own environment as a subprocess.
+# Weights are intentionally not tracked.
 export SAM3_ROOT="$GCA_ROOT/tools/third_party/sam3"
 export SAM3_CHECKPOINT="${SAM3_CHECKPOINT:-$SAM3_ROOT/checkpoints/sam3.pt}"
+export PYTHON_SAM3="${PYTHON_SAM3:-/data2/conda_envs/sam3/bin/python}"
+export SAM3_PYTHONPATH="${SAM3_PYTHONPATH:-$SAM3_ROOT}"
 
 mkdir -p "$GCA_ROOT" "$GCA_HF_HUB" "$U2NET_HOME" \
          "$EASYOCR_MODULE_PATH/model" "$GCA_RUNTIME_CACHE" \

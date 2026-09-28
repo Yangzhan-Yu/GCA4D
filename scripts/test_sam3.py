@@ -23,7 +23,8 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
 
 # Distinct colours per instance, cycled as needed.
 PALETTE = [
@@ -31,6 +32,25 @@ PALETTE = [
     (200, 70, 220), (40, 200, 210), (250, 120, 170), (150, 150, 60),
 ]
 
+
+
+def load_segmenter_class():
+    """Import Sam3TextSegmenter without initialising the whole ``tools`` package.
+
+    SAM3 lives in its own environment (torch>=2.7); that environment does not
+    have the gca env's dependencies, and ``import tools.apis`` pulls in ray and
+    friends.  Loading the adapter module directly by path keeps SAM3 runnable
+    in a separate interpreter.
+    """
+    import importlib.util
+
+    module_path = REPO_ROOT / 'tools' / 'apis' / 'sam3_local.py'
+    if not module_path.exists():
+        raise FileNotFoundError(f'Adapter not found: {module_path}')
+    spec = importlib.util.spec_from_file_location('_gca_sam3_local', module_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.Sam3TextSegmenter
 
 def parse_args():
     parser = argparse.ArgumentParser('SAM3 single-frame smoke test')
@@ -128,7 +148,7 @@ def main():
 
     from PIL import Image
 
-    from tools.apis.sam3_local import Sam3TextSegmenter
+    Sam3TextSegmenter = load_segmenter_class()
 
     checkpoint = os.environ.get('SAM3_CHECKPOINT', '<unset>')
     print(f'[SAM3] checkpoint : {checkpoint}')
