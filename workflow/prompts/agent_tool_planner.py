@@ -81,11 +81,11 @@ Rules:
 - Reuse Scene Memory before requesting new perception.
 - Do not call check_evidence when collect_question_evidence already returned fresh evidence_status.
 - If entity evidence is insufficient, use find_temporal_neighbors and then collect_question_evidence.
-- For object-size or longest-dimension questions, call estimate_object_size when object evidence is sufficient.
-- For object-distance questions, call estimate_metric_scale_and_distance when object evidence is sufficient.
+- For object-size or longest-dimension questions, call estimate_object_size when object evidence is sufficient (it also produces the metric point cloud), then call execute_operation to obtain the verified value.
+- For object-distance questions, call estimate_metric_scale_and_distance when object evidence is sufficient (it also produces metric point clouds), then call execute_operation to obtain the verified value.
 - Never call estimate_metric_scale_and_distance for a size or longest-dimension question.
 - For distance results, inspect quality_flags. If duplicate_masks_suspected, near_identical_pointclouds, or degenerate_distance is present, do not finalize; use detect_objects/select_detection or collect clearer frames.
-- For counting questions, call count_entities_in_video for the counted category; do not use distance or size tools.
+- For counting questions, call count_entities_in_video for the counted category (do not use distance or size tools), then confirm the count with execute_operation.
 - For size questions, first call query_tracks, choose one track, then call estimate_object_size with that track_id. Inspect raw/percentile/OBB extents and quality_flags before accepting the result.
 - Do not blindly accept a size if raw extent and percentile/OBB extents disagree strongly; request more views or use a more reliable track instead.
 - For counting questions, room/place/scene/environment are context only; never create or collect SAM/3D object evidence for them.
