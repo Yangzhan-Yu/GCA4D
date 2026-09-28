@@ -75,10 +75,27 @@ class Sam3TextSegmenter:
         )
 
     @staticmethod
-    def _mask_to_numpy(mask) -> np.ndarray:
-        if hasattr(mask, 'detach'):
-            mask = mask.detach().cpu().numpy()
-        mask = np.asarray(mask)
+    def _to_numpy(value) -> np.ndarray:
+        """Convert a torch tensor (any dtype) or array-like to numpy.
+
+        SAM3 runs under a bf16 autocast context, so outputs such as ``scores``
+        come back as ``torch.bfloat16``.  numpy has no bf16 dtype and raises
+        "Got unsupported ScalarType BFloat16", so widen to float32 first.
+        """
+        if hasattr(value, 'detach'):
+            value = value.detach()
+        dtype = getattr(value, 'dtype', None)
+        if dtype is not None and str(dtype) in ('torch.bfloat16', 'torch.float16'):
+            import torch
+
+            value = value.to(torch.float32)
+        if hasattr(value, 'cpu'):
+            value = value.cpu()
+        return np.asarray(value)
+
+    @classmethod
+    def _mask_to_numpy(cls, mask) -> np.ndarray:
+        mask = cls._to_numpy(mask)
         while mask.ndim > 2 and mask.shape[0] == 1:
             mask = mask[0]
         return mask.astype(bool)
@@ -102,12 +119,8 @@ class Sam3TextSegmenter:
             scores = result.get('scores')
             if masks is None or boxes is None or scores is None:
                 continue
-            if hasattr(boxes, 'detach'):
-                boxes = boxes.detach().cpu().numpy()
-            if hasattr(scores, 'detach'):
-                scores = scores.detach().cpu().numpy()
-            boxes = np.asarray(boxes)
-            scores = np.asarray(scores).reshape(-1)
+            boxes = self._to_numpy(boxes)
+            scores = self._to_numpy(scores).reshape(-1)
 
             for index in range(min(len(scores), len(boxes), len(masks))):
                 mask = self._mask_to_numpy(masks[index])
