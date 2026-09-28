@@ -35,6 +35,23 @@ from tools.apis.temporal_neighbor_search import (
     extract_video_frames_at_timestamps,
 )
 from workflow.agentic.planner_loop import PlannerLoop
+from workflow.constraints.pipeline import (
+    build_context as build_constraint_context,
+    load_constraint,
+    load_result_store,
+    run_operation as run_constraint_operation,
+    save_constraint,
+)
+from workflow.constraints.runtime import (
+    load_bindings,
+    merge_bindings,
+    resolve_extra_inputs,
+    resolve_points,
+    save_bindings,
+)
+from workflow.constraints.task_constraints import compile_task_constraint
+from workflow.constraints.validator import validate_operation as validate_op
+from workflow.constraints.validator import validate_result as validate_res
 from workflow.agentic.tool_synthesizer import (
     ToolSynthesizer,
     load_generated_tool_specs,
@@ -88,6 +105,15 @@ def parse_args():
         type=int,
         default=120,
         help='Maximum number of Qwen API calls for this run (shared by all subprocesses).',
+    )
+    parser.add_argument(
+        '--allow-tool-generation',
+        action='store_true',
+        help=(
+            'Allow the Planner to synthesise/repair and persist new tools. '
+            'Disabled by default so the core constraint experiment uses a '
+            'fixed tool set and stays comparable across questions.'
+        ),
     )
     parser.add_argument('--force-plan', action='store_true')
     parser.add_argument('--reset-agent-memory', action='store_true')
@@ -1185,6 +1211,280 @@ def register_tools(registry: ToolRegistry):
         },
         handler=query_tracks,
     ))
+
+    # ------------------------------------------------------------------
+    # Executable geometry constraint tools
+    # ------------------------------------------------------------------
+    def _constraint_and_bindings(context: Dict[str, Any], args: Dict[str, Any]):
+        constraint = load_constraint(context['scene_root'], context['question_id'])
+        if constraint is None:
+            return None, None, {'error': 'No task constraint compiled for this question'}
+        stored = load_bindings(context['scene_root'], context['question_id'])
+        bindings = merge_bindings(constraint, stored, args.get('bindings'))
+        return constraint, bindings, None
+
+    def get_task_constraint(context: Dict[str, Any], **args):
+        constraint, bindings, error = _constraint_and_bindings(context, args)
+        if error:
+            return error
+        store_root = context['store'].root_dir
+        points = resolve_points(
+            store_root,
+            (constraint.get('operation') or {}).get('operation'),
+            bindings,
+            object_ids=[obj.object_id for obj in context['store'].query_objects()],
+        )
+        metric_scale = read_json(context['scene_root'] / 'evidence' / 'metric_scale.json', {}) or {}
+        frame_id = args.get('coordinate_frame_id') or f"vggt_world_q{context['question_id']}"
+        ctx = build_constraint_context(
+            constraint,
+            context['scene_root'],
+            context['question_id'],
+            store_root=store_root,
+            bindings=bindings,
+            points=points,
+            metric_scale=metric_scale,
+            coordinate_frame_id=frame_id,
+        )
+        report = validate_op(constraint, ctx)
+        return {
+            'constraint_path': str(
+                context['scene_root'] / 'questions' / str(context['question_id']) / 'task_constraint.json'
+            ),
+            'operation': (constraint.get('operation') or {}).get('operation'),
+            'unit': (constraint.get('operation') or {}).get('unit'),
+            'options': (constraint.get('operation') or {}).get('options'),
+            'entity_roles': [
+                {'role': item.get('role'), 'category': item.get('category')}
+                for item in constraint.get('entities', [])
+            ],
+            'reference_frame': constraint.get('reference_frame'),
+            'bindings': bindings,
+            'resolved_roles': sorted(points.keys()),
+            'metric_scale': metric_scale,
+            'validation': report,
+        }
+
+    def bind_constraint_entities(context: Dict[str, Any], **args):
+        constraint = load_constraint(context['scene_root'], context['question_id'])
+        if constraint is None:
+            return {'error': 'No task constraint compiled for this question'}
+        incoming = args.get('bindings') or {}
+        if not isinstance(incoming, dict) or not incoming:
+            return {'error': 'bindings must be a non-empty object'}
+        stored = load_bindings(context['scene_root'], context['question_id'])
+        merged = merge_bindings(constraint, stored, incoming)
+        path = save_bindings(context['scene_root'], context['question_id'], merged)
+        known_ids = {obj.object_id for obj in context['store'].query_objects()}
+        unknown = {
+            role: value
+            for role, value in merged.items()
+            if isinstance(value, str) and value and value not in known_ids
+        }
+        return {
+            'bindings': merged,
+            'bindings_path': str(path),
+            'known_object_ids': sorted(known_ids),
+            'unknown_instances': unknown,
+        }
+
+    def validate_operation_tool(context: Dict[str, Any], **args):
+        constraint, bindings, error = _constraint_and_bindings(context, args)
+        if error:
+            return error
+        store_root = context['store'].root_dir
+        operation = args.get('operation') or (constraint.get('operation') or {}).get('operation')
+        points = resolve_points(
+            store_root,
+            operation,
+            bindings,
+            object_ids=[obj.object_id for obj in context['store'].query_objects()],
+        )
+        metric_scale = read_json(context['scene_root'] / 'evidence' / 'metric_scale.json', {}) or {}
+        frame_id = args.get('coordinate_frame_id') or f"vggt_world_q{context['question_id']}"
+        ctx = build_constraint_context(
+            constraint,
+            context['scene_root'],
+            context['question_id'],
+            store_root=store_root,
+            bindings=bindings,
+            points=points,
+            metric_scale=metric_scale,
+            coordinate_frame_id=frame_id,
+        )
+        report = validate_op(constraint, ctx)
+        return {
+            'operation': operation,
+            'bindings': bindings,
+            'resolved_roles': sorted(points.keys()),
+            'validation': report,
+        }
+
+    def execute_operation_tool(context: Dict[str, Any], **args):
+        constraint, bindings, error = _constraint_and_bindings(context, args)
+        if error:
+            return error
+        store = context['store']
+        store_root = store.root_dir
+        operation = args.get('operation') or (constraint.get('operation') or {}).get('operation')
+        object_ids = [obj.object_id for obj in store.query_objects()]
+        points = resolve_points(store_root, operation, bindings, object_ids=object_ids)
+        metric_scale = read_json(context['scene_root'] / 'evidence' / 'metric_scale.json', {}) or {}
+        frame_id = args.get('coordinate_frame_id') or f"vggt_world_q{context['question_id']}"
+        ctx = build_constraint_context(
+            constraint,
+            context['scene_root'],
+            context['question_id'],
+            store_root=store_root,
+            bindings=bindings,
+            points=points,
+            metric_scale=metric_scale,
+            coordinate_frame_id=frame_id,
+        )
+        extra = resolve_extra_inputs(operation, bindings, args, store=store)
+        inputs = {
+            'points': points,
+            'bindings': bindings,
+            'options': (constraint.get('operation') or {}).get('options') or [],
+        }
+        inputs.update(extra)
+        report = run_constraint_operation(
+            constraint,
+            inputs,
+            context=ctx,
+            scene_root=context['scene_root'],
+            question_id=context['question_id'],
+            persist=True,
+        )
+        if args.get('bindings'):
+            save_bindings(
+                context['scene_root'],
+                context['question_id'],
+                merge_bindings(
+                    constraint,
+                    load_bindings(context['scene_root'], context['question_id']),
+                    args.get('bindings'),
+                ),
+            )
+        return report
+
+    def validate_result_tool(context: Dict[str, Any], **args):
+        store = load_result_store(context['scene_root'], context['question_id'])
+        operation_id = str(args.get('operation_result_id', '')).strip()
+        if not operation_id:
+            return {
+                'error': 'operation_result_id is required',
+                'available_operation_results': sorted(store.all().keys()),
+            }
+        entry = store.get(operation_id)
+        if entry is None:
+            return {
+                'error': f'Unknown operation_result_id: {operation_id}',
+                'available_operation_results': sorted(store.all().keys()),
+            }
+        constraint = load_constraint(context['scene_root'], context['question_id'])
+        report = validate_res(constraint, entry, {})
+        verification = {
+            'operation_result_id': operation_id,
+            'verification_status': 'verified' if report['valid'] else 'rejected',
+            'validation': report,
+            'value': entry.get('value'),
+            'unit': entry.get('unit'),
+            'mapped_answer': report.get('mapped_answer'),
+            'quality_flags': entry.get('quality_flags'),
+        }
+        store.update(operation_id, {
+            'verification_status': verification['verification_status'],
+            'verification': report,
+        })
+        return verification
+
+    registry.register(ToolSpec(
+        name='get_task_constraint',
+        description=(
+            'Show the compiled executable task constraint for this question: '
+            'operation, required roles, current bindings, resolved evidence and '
+            'the structured pre-execution validation report.'
+        ),
+        parameters={'type': 'object', 'properties': {}},
+        handler=get_task_constraint,
+    ))
+    registry.register(ToolSpec(
+        name='bind_constraint_entities',
+        description=(
+            'Bind semantic constraint roles (origin/forward/target/entity_a/'
+            'entity_b/reference_entity/candidate_entities/category) to concrete '
+            'instance ids so the geometric operation can execute.'
+        ),
+        parameters={
+            'type': 'object',
+            'properties': {
+                'bindings': {'type': 'object'},
+            },
+            'required': ['bindings'],
+        },
+        handler=bind_constraint_entities,
+    ))
+    registry.register(ToolSpec(
+        name='validate_operation',
+        description=(
+            'Check whether the current constraint may legally execute: entity '
+            'binding, coordinate frame, geometry version, metric scale, units and '
+            'degeneracy. Returns structured errors with suggested repair actions.'
+        ),
+        parameters={
+            'type': 'object',
+            'properties': {
+                'operation': {'type': 'string'},
+                'bindings': {'type': 'object'},
+                'coordinate_frame_id': {'type': 'string'},
+            },
+        },
+        handler=validate_operation_tool,
+    ))
+    registry.register(ToolSpec(
+        name='execute_operation',
+        description=(
+            'Run the fixed geometric operation for this question (surface_distance, '
+            'relative_direction, argmin_distance, object_extent, count_instances, '
+            'first_visible_order). Validates inputs, computes the value, validates '
+            'the result and stores it with an operation_id. Final answers must cite '
+            'a verified operation_id.'
+        ),
+        parameters={
+            'type': 'object',
+            'properties': {
+                'operation': {'type': 'string'},
+                'bindings': {'type': 'object'},
+                'method': {
+                    'type': 'string',
+                    'enum': ['raw', 'percentile', 'obb'],
+                    'default': 'percentile',
+                },
+                'vertical_axis': {
+                    'type': 'array',
+                    'items': {'type': 'number'},
+                },
+                'coordinate_frame_id': {'type': 'string'},
+            },
+        },
+        handler=execute_operation_tool,
+    ))
+    registry.register(ToolSpec(
+        name='validate_result',
+        description=(
+            'Re-validate one stored operation result by its operation_result_id '
+            'and return the final verification status plus mapped answer.'
+        ),
+        parameters={
+            'type': 'object',
+            'properties': {
+                'operation_result_id': {'type': 'string'},
+            },
+            'required': ['operation_result_id'],
+        },
+        handler=validate_result_tool,
+    ))
     return registry
 
 
@@ -1208,8 +1508,72 @@ def build_state_provider(context):
             == CONTEXT_FRAME_ROLE
             for frame in memory_frames
         )
+        constraint = context.get('task_constraint') or {}
+        question_root = context['scene_root'] / 'questions' / str(context['question_id'])
+        stored_bindings = read_json(question_root / 'entity_bindings.json', {}) or {}
+        op_results = read_json(question_root / 'operation_results.json', {}) or {}
+        verified_results = {
+            key: {
+                'operation': value.get('operation'),
+                'value': value.get('value'),
+                'unit': value.get('unit'),
+                'quality_flags': value.get('quality_flags'),
+            }
+            for key, value in op_results.items()
+            if value.get('verification_status') == 'verified'
+        }
+        constraint_validation = {}
+        if constraint:
+            try:
+                bindings = merge_bindings(constraint, stored_bindings)
+                operation = (constraint.get('operation') or {}).get('operation')
+                points = resolve_points(
+                    store.root_dir,
+                    operation,
+                    bindings,
+                    object_ids=[obj.object_id for obj in store.query_objects()],
+                )
+                metric_scale = read_json(evidence_dir / 'metric_scale.json', {}) or {}
+                constraint_validation = validate_op(
+                    constraint,
+                    build_constraint_context(
+                        constraint,
+                        context['scene_root'],
+                        context['question_id'],
+                        store_root=store.root_dir,
+                        bindings=bindings,
+                        points=points,
+                        metric_scale=metric_scale,
+                        coordinate_frame_id=f"vggt_world_q{context['question_id']}",
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001
+                constraint_validation = {'valid': False, 'error': str(exc)}
         return {
             'scene_summary': scene_summary,
+            'task_constraint': {
+                'operation': (constraint.get('operation') or {}).get('operation'),
+                'unit': (constraint.get('operation') or {}).get('unit'),
+                'options': (constraint.get('operation') or {}).get('options'),
+                'entity_roles': [
+                    {'role': item.get('role'), 'category': item.get('category')}
+                    for item in constraint.get('entities', [])
+                ],
+                'reference_frame': constraint.get('reference_frame'),
+            } if constraint else {},
+            'constraint_bindings': stored_bindings,
+            'constraint_validation': constraint_validation,
+            'operation_results': {
+                key: {
+                    'operation': value.get('operation'),
+                    'value': value.get('value'),
+                    'unit': value.get('unit'),
+                    'quality_flags': value.get('quality_flags'),
+                    'verification_status': value.get('verification_status'),
+                }
+                for key, value in op_results.items()
+            },
+            'verified_operation_results': verified_results,
             'evidence_status': read_json(evidence_dir / 'evidence_status.json', {}),
             'next_evidence_request': read_json(evidence_dir / 'next_evidence_request.json', {}),
             'metric_scale': read_json(evidence_dir / 'metric_scale.json', {}),
@@ -1251,6 +1615,92 @@ def sanitize_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
         if entity in meta_entities:
             sanitized['reference_frame'] = 'world'
     return sanitized
+
+
+def make_done_validator(context):
+    """Gate the Planner's final answer on a verified operation result."""
+
+    def validator(decision: Dict[str, Any]) -> Dict[str, Any]:
+        constraint = context.get('task_constraint') or {}
+        declared_operation = (constraint.get('operation') or {}).get('operation')
+        if not declared_operation:
+            return {
+                'accepted': True,
+                'gate': 'disabled',
+                'reason': (
+                    'No executable operation is defined for this question type; '
+                    'accepting the free-form answer.'
+                ),
+            }
+        store = load_result_store(context['scene_root'], context['question_id'])
+        results = store.all()
+        op_id = (
+            decision.get('operation_result_id')
+            or decision.get('operation_id')
+            or ''
+        )
+        op_id = str(op_id).strip()
+        verified = [
+            key for key, value in results.items()
+            if value.get('verification_status') == 'verified'
+        ]
+        if not op_id:
+            if len(verified) == 1:
+                op_id = verified[0]
+            else:
+                return {
+                    'accepted': False,
+                    'reason': (
+                        'A final answer must cite a verified operation_result_id. '
+                        'Call execute_operation, then finalize with its operation_id.'
+                    ),
+                    'available_operation_results': sorted(results),
+                    'verified_operation_results': verified,
+                    'suggested_actions': ['execute_operation'],
+                }
+        entry = results.get(op_id)
+        if entry is None:
+            return {
+                'accepted': False,
+                'reason': f'Unknown operation_result_id: {op_id}',
+                'available_operation_results': sorted(results),
+                'verified_operation_results': verified,
+            }
+        if entry.get('verification_status') != 'verified':
+            return {
+                'accepted': False,
+                'reason': (
+                    f'Operation result {op_id} is not verified; repair the '
+                    'reported errors before finalizing.'
+                ),
+                'operation_result_id': op_id,
+                'errors': (entry.get('verification') or {}).get('errors', []),
+                'quality_flags': entry.get('quality_flags'),
+                'suggested_actions': [
+                    error.get('suggested_actions', ['execute_operation'])
+                    for error in (entry.get('verification') or {}).get('errors', [])
+                ],
+            }
+        report = validate_res(context.get('task_constraint') or {}, entry, {})
+        if not report['valid']:
+            return {
+                'accepted': False,
+                'reason': f'Operation result {op_id} failed re-validation.',
+                'operation_result_id': op_id,
+                'errors': report['errors'],
+            }
+        verified_answer = report.get('mapped_answer')
+        if verified_answer is None:
+            verified_answer = entry.get('value')
+        return {
+            'accepted': True,
+            'operation_result_id': op_id,
+            'verified_value': entry.get('value'),
+            'unit': entry.get('unit'),
+            'final_answer': str(verified_answer),
+        }
+
+    return validator
 
 
 async def main():
@@ -1333,6 +1783,26 @@ async def main():
     planner_plan = sanitize_plan({
         key: value for key, value in plan.items() if key != 'ground_truth'
     })
+    task_constraint = compile_task_constraint(planner_plan)
+    constraint_file = save_constraint(task_constraint, scene_root, args.question_id)
+    task_constraint_dict = task_constraint.to_dict()
+    print(
+        f'[Constraint] Compiled executable task constraint: {constraint_file}',
+        flush=True,
+    )
+    print(
+        '[Constraint] operation='
+        f"{task_constraint_dict['operation']['operation']!r} "
+        f"unit={task_constraint_dict['operation']['unit']!r} roles="
+        f"{[item['role'] + ':' + item['category'] for item in task_constraint_dict['entities']]}",
+        flush=True,
+    )
+    if task_constraint_dict['operation']['operation'] is None:
+        print(
+            '[Constraint] WARNING: no executable operation is defined for this '
+            'question type; the Planner falls back to open-ended tool use.',
+            flush=True,
+        )
 
     store = open_vsibench_memory(
         data_root=data_root,
@@ -1363,17 +1833,25 @@ async def main():
     agent_memory = AgentMemory.load(agent_memory_path) if agent_memory_path.exists() else AgentMemory()
 
     registry = register_tools(ToolRegistry())
-    for generated_spec in load_generated_tool_specs(
-        repo_root / 'tools' / 'generated'
-    ):
-        if generated_spec.name not in {
-            spec.name for spec in registry.list_specs()
-        }:
-            registry.register(generated_spec)
-            print(
-                f'[ToolRegistry] Loaded generated tool: {generated_spec.name}',
-                flush=True,
-            )
+    if args.allow_tool_generation:
+        for generated_spec in load_generated_tool_specs(
+            repo_root / 'tools' / 'generated'
+        ):
+            if generated_spec.name not in {
+                spec.name for spec in registry.list_specs()
+            }:
+                registry.register(generated_spec)
+                print(
+                    f'[ToolRegistry] Loaded generated tool: {generated_spec.name}',
+                    flush=True,
+                )
+        print('[ToolRegistry] Tool generation ENABLED.', flush=True)
+    else:
+        print(
+            '[ToolRegistry] Tool generation disabled: fixed tool set for the '
+            'core constraint experiment (pass --allow-tool-generation to enable).',
+            flush=True,
+        )
     context = {
         'repo_root': repo_root,
         'data_root': data_root,
@@ -1383,6 +1861,7 @@ async def main():
         'question_id': args.question_id,
         'question_type': question['question_type'],
         'scene_root': scene_root,
+        'task_constraint': task_constraint_dict,
         'store': store,
         'device': args.device,
         'tool_vlm_client': sync_client,
@@ -1390,10 +1869,14 @@ async def main():
         'base_url': base_url,
         'api_key': api_key,
     }
-    tool_synthesizer = ToolSynthesizer(
-        client=client,
-        model=model,
-        generated_dir=repo_root / 'tools' / 'generated',
+    tool_synthesizer = (
+        ToolSynthesizer(
+            client=client,
+            model=model,
+            generated_dir=repo_root / 'tools' / 'generated',
+        )
+        if args.allow_tool_generation
+        else None
     )
     loop = PlannerLoop(
         client=client,
@@ -1407,10 +1890,27 @@ async def main():
         max_tool_failures=args.max_tool_failures,
         state_provider=build_state_provider(context),
         tool_synthesizer=tool_synthesizer,
+        done_validator=make_done_validator(context),
     )
     print('[Agent] Starting Planner loop...', flush=True)
     result = await loop.run(question=plan['question'], plan=planner_plan)
     agent_memory.save(agent_memory_path)
+    result['task_constraint'] = task_constraint_dict
+    result['constraint_dir'] = str(
+        scene_root / 'questions' / str(args.question_id)
+    )
+    result['operation_results'] = {
+        key: {
+            'operation': value.get('operation'),
+            'value': value.get('value'),
+            'unit': value.get('unit'),
+            'quality_flags': value.get('quality_flags'),
+            'verification_status': value.get('verification_status'),
+        }
+        for key, value in load_result_store(
+            scene_root, args.question_id
+        ).all().items()
+    }
     result['api_budget'] = get_api_budget()
     result_path = evidence_dir / 'agent_result.json'
     result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')

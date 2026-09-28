@@ -19,30 +19,14 @@ Return exactly one JSON object:
   "args": {}
 }
 
-When no existing tool implements the required capability, request a new tool:
-{
-  "thought": "brief reasoning",
-  "done": false,
-  "round_done": false,
-  "mode": "create_tool",
-  "capability": "short description of the missing capability"
-}
-
-When a generated tool fails and should be fixed:
-{
-  "thought": "brief reasoning",
-  "done": false,
-  "round_done": false,
-  "mode": "repair_tool",
-  "tool_name": "generated tool name",
-  "error": "observed error"
-}
+{tool_creation_note}
 
 When evidence is sufficient and the answer has been computed, return:
 {
   "thought": "brief reasoning",
   "done": true,
-  "final_answer": "answer"
+  "final_answer": "answer",
+  "operation_result_id": "the id returned by execute_operation"
 }
 
 Available tools:
@@ -56,6 +40,12 @@ Question:
 
 Evidence Plan:
 {plan}
+
+Executable Task Constraint:
+{task_constraint}
+
+Constraint State (bindings, validation, executed operations):
+{constraint_state}
 
 Scene Memory Summary:
 {scene_summary}
@@ -73,10 +63,10 @@ step_in_round: {step_index}
 
 Rules:
 - Use the minimum necessary evidence.
-- Prefer an existing tool. Use create_tool only when no available tool can provide the required capability.
+- Prefer an existing tool. You may request a new tool only when the tool-creation mode is available.
 - After a tool is created, call it in a subsequent step and inspect its output.
-- Base models such as VGGT, SAM2, MoGe and the VLM are primitives; do not ask the tool maker to reimplement them.
 - If a generated tool fails, request repair_tool with the concrete error instead of repeating the same call.
+- Base models such as VGGT, SAM2, MoGe and the VLM are primitives; do not ask the tool maker to reimplement them.
 - Stop immediately when required evidence is sufficient and the answer is computed.
 - Continue calling tools inside the current round when evidence is still insufficient.
 - Set round_done=true only when the current evidence-gathering round is complete; it is not needed after each tool call.
@@ -110,6 +100,13 @@ Rules:
 - Counting must use 3D object tracks/observations; do not request VLM multi-frame counting unless explicitly enabled.
 - Do not repeat a failed request without a changed argument.
 - Do not fabricate geometric values.
+- The question is compiled into an executable task constraint (operation, unit, roles).
+- Do not answer from free-form reasoning when the constraint defines an executable operation. Call execute_operation and finalize with the returned operation_result_id.
+- execute_operation validates its inputs, runs the fixed geometry, validates the result and stores it. Repair the specific error_type it reports instead of retrying blindly.
+- If constraint_validation reports entity_not_bound or ambiguous_entity_binding, call bind_constraint_entities with concrete instance ids before executing.
+- If execute_operation returns status=rejected at stage=validate_operation, fix the reported bindings/frame/scale error. If it rejects at stage=validate_result, collect better evidence or change the bound instances.
+- A done=true answer is only accepted when it cites a verified operation_result_id. If verification rejects it, you will receive the errors and must repair them.
+- Never invent an operation_result_id; use exactly the id returned by execute_operation.
 - Output JSON only.
 """.strip()
 
@@ -125,8 +122,30 @@ def build_agent_tool_planner_prompt(
     max_rounds=1,
     step_index=1,
     max_steps_per_round=None,
+    task_constraint=None,
+    constraint_state=None,
+    allow_tool_creation=True,
 ):
     import json
+    if allow_tool_creation:
+        tool_creation_note = (
+            'When no existing tool implements the required capability, request '
+            'a new tool:\n'
+            '{\n  "thought": "brief reasoning",\n  "done": false,\n'
+            '  "round_done": false,\n  "mode": "create_tool",\n'
+            '  "capability": "short description of the missing capability"\n}\n\n'
+            'When a generated tool fails and should be fixed:\n'
+            '{\n  "thought": "brief reasoning",\n  "done": false,\n'
+            '  "round_done": false,\n  "mode": "repair_tool",\n'
+            '  "tool_name": "generated tool name",\n'
+            '  "error": "observed error"\n}'
+        )
+    else:
+        tool_creation_note = (
+            'Tool creation is disabled for this run. Use only the tools listed '
+            'above; if a capability is missing, gather the closest available '
+            'evidence instead of inventing a tool.'
+        )
     step_budget_note = (
         'There is no fixed per-round tool target. End the round when evidence '
         'is sufficient or no useful action remains.'
@@ -140,7 +159,10 @@ def build_agent_tool_planner_prompt(
         AGENT_TOOL_PLANNER_PROMPT
         .replace('{question}', str(question))
         .replace('{plan}', json.dumps(plan, ensure_ascii=False, indent=2))
+        .replace('{task_constraint}', json.dumps(task_constraint or {}, ensure_ascii=False, indent=2))
+        .replace('{constraint_state}', json.dumps(constraint_state or {}, ensure_ascii=False, indent=2))
         .replace('{tools}', json.dumps(tools, ensure_ascii=False, indent=2))
+        .replace('{tool_creation_note}', tool_creation_note)
         .replace('{scene_summary}', json.dumps(scene_summary, ensure_ascii=False, indent=2))
         .replace('{evidence_status}', json.dumps(evidence_status, ensure_ascii=False, indent=2))
         .replace('{agent_summary}', json.dumps(agent_summary, ensure_ascii=False, indent=2))

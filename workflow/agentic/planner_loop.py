@@ -23,6 +23,7 @@ class PlannerLoop:
         max_tool_failures: int = 2,
         state_provider: Optional[Callable[[], Dict[str, Any]]] = None,
         tool_synthesizer=None,
+        done_validator: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
     ):
         self.client = client
         self.model = model
@@ -45,6 +46,7 @@ class PlannerLoop:
         self.tool_failure_counts = {}
         self.state_provider = state_provider
         self.tool_synthesizer = tool_synthesizer
+        self.done_validator = done_validator
 
     def _state(self) -> Dict[str, Any]:
         if self.state_provider is None:
@@ -124,6 +126,16 @@ class PlannerLoop:
                     max_rounds=self.max_rounds,
                     step_index=step_index,
                     max_steps_per_round=self.max_steps_per_round,
+                    allow_tool_creation=self.tool_synthesizer is not None,
+                    task_constraint=state.get('task_constraint', {}),
+                    constraint_state={
+                        'bindings': state.get('constraint_bindings', {}),
+                        'validation': state.get('constraint_validation', {}),
+                        'operation_results': state.get('operation_results', {}),
+                        'verified_operation_results': state.get(
+                            'verified_operation_results', {}
+                        ),
+                    },
                 )
                 try:
                     reserve_api_call(
@@ -175,16 +187,43 @@ class PlannerLoop:
                     )
 
                 if decision.get('done'):
+                    final_answer = decision.get('final_answer')
+                    verification = None
+                    if self.done_validator is not None:
+                        try:
+                            verification = self.done_validator(decision)
+                        except Exception as exc:  # noqa: BLE001
+                            verification = {
+                                'accepted': False,
+                                'reason': f'done_validator raised {type(exc).__name__}: {exc}',
+                            }
+                        if not verification.get('accepted'):
+                            print(
+                                '[Planner] Final answer rejected by constraint '
+                                f"verification: {verification.get('reason')}",
+                                flush=True,
+                            )
+                            if self.agent_memory is not None:
+                                self.agent_memory.add(
+                                    'done_rejected',
+                                    round=round_index,
+                                    step=step_index,
+                                    decision=decision,
+                                    verification=verification,
+                                )
+                            continue
+                        final_answer = verification.get('final_answer', final_answer)
                     print(
-                        f"[Planner] Done. final_answer={decision.get('final_answer')}",
+                        f'[Planner] Done. final_answer={final_answer}',
                         flush=True,
                     )
                     return {
                         'done': True,
-                        'final_answer': decision.get('final_answer'),
+                        'final_answer': final_answer,
                         'rounds': round_index + 1,
                         'steps': total_steps,
                         'decision': decision,
+                        'verification': verification,
                     }
 
                 if decision.get('round_done'):

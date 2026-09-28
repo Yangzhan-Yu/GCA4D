@@ -188,3 +188,7 @@ work_dir/
 # Python cache
 __pycache__/
 *.pyc
+
+# SAM3 weights and nested repository metadata
+tools/third_party/sam3/.git/
+tools/third_party/sam3/checkpoints/
