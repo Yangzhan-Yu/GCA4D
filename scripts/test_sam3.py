@@ -66,6 +66,10 @@ def parse_args():
     parser.add_argument('--resolution', type=int, default=1008,
                         help='SAM3 processor resolution (default 1008)')
     parser.add_argument('--output-dir', default='work_dir/sam3_smoke')
+    parser.add_argument(
+        '--no-autocast', action='store_true',
+        help='Disable the bf16 autocast context SAM3 expects (debugging only)',
+    )
     return parser.parse_args()
 
 
@@ -163,6 +167,7 @@ def main():
         device=args.device,
         confidence_threshold=args.confidence,
         resolution=args.resolution,
+        use_bf16_autocast=not args.no_autocast,
     )
 
     started = time.perf_counter()
@@ -178,7 +183,10 @@ def main():
     try:
         results = segmenter.segment(image, args.prompts)
     except Exception as exc:  # noqa: BLE001
+        import traceback
+
         print(f'[SAM3] INFERENCE FAILED: {type(exc).__name__}: {exc}')
+        traceback.print_exc()
         return 1
     infer_seconds = time.perf_counter() - started
 

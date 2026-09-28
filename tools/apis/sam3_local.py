@@ -15,6 +15,7 @@ class Sam3TextSegmenter:
         device: str = 'cuda',
         confidence_threshold: float = 0.5,
         resolution: int = 1008,
+        use_bf16_autocast: bool = True,
     ):
         self.checkpoint_path = (
             checkpoint_path
@@ -23,6 +24,13 @@ class Sam3TextSegmenter:
         self.device = device
         self.confidence_threshold = confidence_threshold
         self.resolution = resolution
+        # SAM3's image model is designed to run under a global bf16 autocast
+        # context.  Every official entry point enters one before building the
+        # model (see examples/sam3_image_predictor_example.ipynb and
+        # scripts/measure_speed.py).  Without it the model mixes bf16 and fp32
+        # activations and fails with "mat1 and mat2 must have the same dtype".
+        self.use_bf16_autocast = use_bf16_autocast
+        self._autocast_context = None
         self.model = None
         self.processor = None
 
@@ -38,8 +46,20 @@ class Sam3TextSegmenter:
         if not checkpoint.exists():
             raise FileNotFoundError(f'SAM3 checkpoint not found: {checkpoint}')
 
+        import torch
+
         from sam3.model_builder import build_sam3_image_model
         from sam3.model.sam3_image_processor import Sam3Processor
+
+        if self.use_bf16_autocast and str(self.device).startswith('cuda'):
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            # Keep a reference: the context stays entered for the whole process,
+            # matching the official SAM3 inference examples.
+            self._autocast_context = torch.autocast(
+                device_type='cuda', dtype=torch.bfloat16
+            )
+            self._autocast_context.__enter__()
 
         self.model = build_sam3_image_model(
             checkpoint_path=str(checkpoint),
