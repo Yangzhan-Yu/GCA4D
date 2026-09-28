@@ -1,0 +1,32 @@
+{
+    "benchmark": "vsibench",
+    "cache_dir": "/data3/Agentic-Spatial-Reasoning/hf_cache/hub",
+    "tools_to_use": [
+        "FinalAnswerGenerator",
+        "GeometricReconstructor",
+        "ObjPoseEstimator",
+        "PythonTool",
+        "SemanticDetector"
+    ],
+    "question_type": [
+        "object_counting",
+        "object_abs_distance",
+        "object_size_estimation",
+        "room_size_estimation",
+        "object_rel_distance",
+        "object_rel_direction_easy",
+        "object_rel_direction_medium",
+        "object_rel_direction_hard",
+        "route_planning",
+        "obj_appearance_order"
+    ],
+    "work_dir": null,
+    "use_knowledge_augmented_code_generation": true,
+    "use_meta_planner": false,
+    "use_reasoner_for_detection": true,
+    "generate_report_on_completion": true,
+    "enable_logging": true,
+    "enable_visual_feedback": true,
+    "enable_serve_autoscaling": true,
+    "max_visuals_to_load": 8
+}

@@ -1,0 +1,35 @@
+实验模型配置+API设置
+cd /data3/Agentic-Spatial-Reasoning/gca-main
+conda activate gca
+source scripts/gca_env.sh
+
+export AGENT_COT_REASONER_MODEL='qwen3-vl-235b-a22b-thinking'
+export AGENT_COT_REASONER_BASE_URL='https://dashscope.aliyuncs.com/compatible-mode/v1'
+export AGENT_COT_REASONER_API_KEY='sk-ws-H.PIPXDMX.S5RO.MEUCIQCwgbHsIjcczy7I4M0nQQJZQIDrI9YqJu609FhyaNz8EQIgX9mIXO8EHnVSJ_J5i75czPgF_0yFBPLq9V6TkF6cl2k'
+export AGENT_COT_REASONER_PROXY=''
+
+export AGENT_CODE_GENERATOR_MODEL='qwen3-vl-235b-a22b-thinking'
+export AGENT_CODE_GENERATOR_BASE_URL='https://dashscope.aliyuncs.com/compatible-mode/v1'
+export AGENT_CODE_GENERATOR_API_KEY='sk-ws-H.PIPXDMX.S5RO.MEUCIQCwgbHsIjcczy7I4M0nQQJZQIDrI9YqJu609FhyaNz8EQIgX9mIXO8EHnVSJ_J5i75czPgF_0yFBPLq9V6TkF6cl2k'
+export AGENT_CODE_GENERATOR_PROXY=''
+
+
+
+完整证据收集
+ CUDA_VISIBLE_DEVICES=0 python -m entrypoints.run_vsibench_agent \
+    --dataset arkitscenes \
+    --scene-name 41069025 \
+    --question-id 680 \
+    --max-tool-failures 2 \
+    --reset-agent-memory
+
+
+目前有几个问题要解决
+距离计算不精确 
+/data3/Agentic-Spatial-Reasoning/gca-main/results/VSI-Bench-Counting/arkitscenes/41069025/evidence/object_pointclouds.png  这个图的输出与真实物体有差距 会不会也是距离计算不精确的原因
+还没真正实现agent写代码+调用工具做证据收集
+还有实时性的问题
+VGGT重建选择的图要求太苛刻了还是选择数目太少
+跑完整个数据集要花多少
+
+ CUDA_VISIBLE_DEVICES=7 bash scripts/run_vsibench_type_smoke.sh

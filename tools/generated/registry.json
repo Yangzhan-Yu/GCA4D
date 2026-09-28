@@ -1,0 +1,100 @@
+{
+  "tools": {
+    "count_entities_in_frames": {
+      "name": "count_entities_in_frames",
+      "description": "Count unique physical instances of an entity across specified frame paths by querying VLM per frame and taking the maximum observed count.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "entity": {
+            "type": "string"
+          },
+          "frame_paths": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "entity",
+          "frame_paths"
+        ]
+      },
+      "source_path": "/data3/Agentic-Spatial-Reasoning/gca-main/tools/generated/count_unique_physical_instances_of_an_entity_in_a_specified_list_of_frame_paths.py",
+      "metadata": {
+        "generated": true,
+        "capability": "Count unique physical instances of an entity in a specified list of frame paths",
+        "synthesizer_model": "qwen3-vl-235b-a22b-thinking",
+        "validation": {
+          "valid": true,
+          "errors": [],
+          "tool_spec": {
+            "name": "count_entities_in_frames",
+            "description": "Count unique physical instances of an entity across specified frame paths by querying VLM per frame and taking the maximum observed count.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "entity": {
+                  "type": "string"
+                },
+                "frame_paths": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              },
+              "required": [
+                "entity",
+                "frame_paths"
+              ]
+            }
+          },
+          "source_path": "/data3/Agentic-Spatial-Reasoning/gca-main/tools/generated/count_unique_physical_instances_of_an_entity_in_a_specified_list_of_frame_paths.py"
+        }
+      }
+    },
+    "generate_room_context": {
+      "name": "generate_room_context",
+      "description": "Generate full-frame bounding boxes and SAM masks for the 'room' entity to establish spatial context for counting tasks.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "entity": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "entity"
+        ]
+      },
+      "source_path": "/data3/Agentic-Spatial-Reasoning/gca-main/tools/generated/generate_room_context_evidence_for_input_frames_create_full_frame_bounding_boxes_0_0_width_height_and_sam_masks_covering_the_entire_frame_for_the_room_entity.py",
+      "metadata": {
+        "generated": true,
+        "capability": "Generate room context evidence: for input frames, create full-frame bounding boxes (0,0,width,height) and SAM masks covering the entire frame for the 'room' entity.",
+        "synthesizer_model": "qwen3-vl-235b-a22b-thinking",
+        "validation": {
+          "valid": true,
+          "errors": [],
+          "tool_spec": {
+            "name": "generate_room_context",
+            "description": "Generate full-frame bounding boxes and SAM masks for the 'room' entity to establish spatial context for counting tasks.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "entity": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "entity"
+              ]
+            }
+          },
+          "source_path": "/data3/Agentic-Spatial-Reasoning/gca-main/tools/generated/generate_room_context_evidence_for_input_frames_create_full_frame_bounding_boxes_0_0_width_height_and_sam_masks_covering_the_entire_frame_for_the_room_entity.py"
+        }
+      }
+    }
+  }
+}
