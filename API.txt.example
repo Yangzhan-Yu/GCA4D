@@ -1,0 +1,41 @@
+# Copy to API.txt and fill in real keys.  API.txt is git-ignored.
+#
+# The agent uses two roles:
+#   planner : text-only decisions (tool selection, JSON output)
+#   vlm     : vision calls (candidate checking, VLM detection fallback)
+#
+# Both roles fall back to AGENT_COT_REASONER_* when their own vars are absent,
+# so a single-model setup still works.  Set AGENT_PLANNER_* to move planning
+# onto a cheaper text model.
+
+# ---------------------------------------------------------------------
+# Planner (text-only).  Any OpenAI-compatible chat model works.
+# ---------------------------------------------------------------------
+export AGENT_PLANNER_MODEL='qwen3.7-plus'
+export AGENT_PLANNER_BASE_URL='https://dashscope.aliyuncs.com/compatible-mode/v1'
+export AGENT_PLANNER_API_KEY='sk-REPLACE_ME'
+
+# ---------------------------------------------------------------------
+# VLM (vision).  Required for verify_candidate and the VLM detector.
+# ---------------------------------------------------------------------
+export AGENT_VLM_MODEL='qwen3-vl-plus'
+export AGENT_VLM_BASE_URL='https://dashscope.aliyuncs.com/compatible-mode/v1'
+export AGENT_VLM_API_KEY='sk-REPLACE_ME'
+
+# ---------------------------------------------------------------------
+# Legacy single-model configuration (still supported).
+# Used by any role whose own variables are incomplete.
+# ---------------------------------------------------------------------
+export AGENT_COT_REASONER_MODEL='qwen3-vl-plus'
+export AGENT_COT_REASONER_BASE_URL='https://dashscope.aliyuncs.com/compatible-mode/v1'
+export AGENT_COT_REASONER_API_KEY='sk-REPLACE_ME'
+export AGENT_COT_REASONER_PROXY=''
+
+# ---------------------------------------------------------------------
+# Optional code/tool-generation model (only used with
+# --allow-tool-generation, and as a last-resort role fallback).
+# ---------------------------------------------------------------------
+export AGENT_CODE_GENERATOR_MODEL='qwen3-vl-plus'
+export AGENT_CODE_GENERATOR_BASE_URL='https://dashscope.aliyuncs.com/compatible-mode/v1'
+export AGENT_CODE_GENERATOR_API_KEY='sk-REPLACE_ME'
+export AGENT_CODE_GENERATOR_PROXY=''

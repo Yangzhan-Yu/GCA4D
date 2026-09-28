@@ -3,7 +3,9 @@ set -u
 
 cd /data3/Agentic-Spatial-Reasoning/gca-main
 source scripts/gca_env.sh
-eval "$(grep -E '^export AGENT_COT_REASONER_(BASE_URL|API_KEY|MODEL)=' API.txt)"
+# Planner model (text-only) and VLM model (vision) may be configured
+# separately; both fall back to the legacy AGENT_COT_REASONER_* vars.
+eval "$(grep -E '^export AGENT_(PLANNER|VLM|COT_REASONER)_(BASE_URL|API_KEY|MODEL)=' API.txt)"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-6}"
 mkdir -p logs

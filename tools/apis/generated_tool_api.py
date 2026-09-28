@@ -151,14 +151,37 @@ def vlm_chat(
     max_tokens: int = 2048,
 ) -> str:
     reserve_api_call('generated_tool_vlm_chat')
-    client = OpenAI(
-        base_url=context.get('base_url') or os.environ['AGENT_COT_REASONER_BASE_URL'],
-        api_key=context.get('api_key') or os.environ['AGENT_COT_REASONER_API_KEY'],
+    base_url = context.get('base_url')
+    api_key = context.get('api_key')
+    model = context.get('model')
+    if not (base_url and api_key and model):
+        from tools.apis.llm_endpoint import (
+            chat_text,
+            create_sync_client,
+            resolve_endpoint,
+        )
+
+        endpoint = resolve_endpoint('vlm')
+        base_url = base_url or endpoint.base_url
+        api_key = api_key or endpoint.api_key
+        model = model or endpoint.model
+        client = context.get('vlm_client') or create_sync_client(endpoint)
+        return chat_text(
+            client,
+            model=model,
+            messages=[{'role': 'user', 'content': content}],
+            max_tokens=max_tokens,
+            temperature=0.0,
+            top_p=0.95,
+        )
+    client = context.get('vlm_client') or OpenAI(
+        base_url=base_url,
+        api_key=api_key,
         timeout=120.0,
         max_retries=2,
     )
     response = client.chat.completions.create(
-        model=context['model'],
+        model=model,
         messages=[{'role': 'user', 'content': content}],
         max_tokens=max_tokens,
         temperature=0.0,

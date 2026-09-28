@@ -55,6 +55,7 @@ from tools.apis.keyframe_selector import (
 from tools.apis.vggt_model import load_and_preprocess_images
 from tools.apis.vlm_grounding import detect_entities_vlm
 from tools.utils.mm_utils import visualize_3d_object, visualize_3d_scene
+from tools.apis.llm_endpoint import resolve_endpoint
 from tools.utils.vlm_as_detector import qwen3_prompt
 
 
@@ -668,18 +669,20 @@ def main():
     device = torch.device(args.device)
     vlm_client, vlm_model = None, None
     processor, detector = None, None
-    base_url = os.environ.get('AGENT_COT_REASONER_BASE_URL')
-    api_key = os.environ.get('AGENT_COT_REASONER_API_KEY')
-    vlm_model = os.environ.get('AGENT_COT_REASONER_MODEL')
-    if base_url and api_key and vlm_model:
+    vlm_endpoint = resolve_endpoint('vlm', required=args.detector == 'vlm')
+    if vlm_endpoint is not None:
+        vlm_model = vlm_endpoint.model
         vlm_client = OpenAI(
-            base_url=base_url,
-            api_key=api_key,
+            base_url=vlm_endpoint.base_url,
+            api_key=vlm_endpoint.api_key,
             timeout=args.api_timeout,
             max_retries=5,
         )
+        print(f'[VLM] Endpoint: {vlm_endpoint.describe()}', flush=True)
     if args.detector == 'vlm' and vlm_client is None:
-        raise ValueError('VLM detector requires AGENT_COT_REASONER_* variables')
+        raise ValueError(
+            'VLM detector requires AGENT_VLM_* or AGENT_COT_REASONER_* variables'
+        )
     if args.detector == 'grounding_dino':
         processor = AutoProcessor.from_pretrained(GROUNDING_DINO_ID, cache_dir=CACHE_DIR, local_files_only=True)
         detector = AutoModelForZeroShotObjectDetection.from_pretrained(

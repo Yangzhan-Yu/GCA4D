@@ -1,6 +1,7 @@
 import json
 from typing import Any, Callable, Dict, Optional
 
+from tools.apis.llm_endpoint import async_chat_text
 from workflow.agentic.tool_executor import ToolExecutor
 from workflow.agentic.tool_registry import ToolRegistry
 from tools.apis.api_budget import ApiBudgetExceeded, reserve_api_call
@@ -145,7 +146,8 @@ class PlannerLoop:
                             'step': step_index,
                         },
                     )
-                    response = await self.client.chat.completions.create(
+                    content = await async_chat_text(
+                        self.client,
                         model=self.model,
                         messages=[{'role': 'user', 'content': prompt}],
                         max_tokens=2048,
@@ -159,7 +161,17 @@ class PlannerLoop:
                         'rounds': round_index + 1,
                         'steps': total_steps,
                     }
-                content = response.choices[0].message.content
+                except Exception as exc:  # noqa: BLE001 - provider/model errors
+                    print(
+                        f'[Planner] API call failed: {type(exc).__name__}: {exc}',
+                        flush=True,
+                    )
+                    return {
+                        'done': False,
+                        'error': f'Planner API call failed: {type(exc).__name__}: {exc}',
+                        'rounds': round_index + 1,
+                        'steps': total_steps,
+                    }
                 print(f'[Planner] Raw response:\n{content}', flush=True)
                 if self.agent_memory is not None:
                     self.agent_memory.add(

@@ -502,6 +502,9 @@ CUDA_VISIBLE_DEVICES=0 python -m entrypoints.run_vsibench_agent \
 
 新增（可选）参数：`--allow-tool-generation`。
 
+Planner 与 VLM 现在可分开配置（`AGENT_PLANNER_*` / `AGENT_VLM_*`，未配置时回退到
+`AGENT_COT_REASONER_*`）。详见 `GCA_model_switching_guide.md` 与 `API.txt.example`。
+
 每题产物：
 
 ```text

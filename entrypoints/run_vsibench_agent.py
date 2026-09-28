@@ -11,8 +11,6 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw
 
-from openai import AsyncOpenAI, OpenAI
-
 from tools.apis.agent_memory import AgentMemory
 from tools.apis.api_budget import (
     ApiBudgetExceeded,
@@ -22,6 +20,12 @@ from tools.apis.api_budget import (
 )
 from tools.apis.vlm_grounding import image_to_data_uri
 from tools.apis.grounding_dino_local import GroundingDinoDetector
+from tools.apis.llm_endpoint import (
+    async_chat_text,
+    create_async_client,
+    create_sync_client,
+    resolve_endpoint,
+)
 from tools.apis.four_d_memory import (
     CONTEXT_FRAME_ROLE,
     EVIDENCE_FRAME_ROLE,
@@ -470,8 +474,8 @@ def register_tools(registry: ToolRegistry):
             'qwen_check_candidate',
             {'frame_id': frame_id, 'entity': entity},
         )
-        response = context['tool_vlm_client'].chat.completions.create(
-            model=context['model'],
+        response = context.get('vlm_client', context['tool_vlm_client']).chat.completions.create(
+            model=context.get('vlm_model', context['model']),
             messages=[{
                 'role': 'user',
                 'content': [
@@ -951,8 +955,8 @@ def register_tools(registry: ToolRegistry):
             })
 
         reserve_api_call('count_entities_in_video', {'entity': entity})
-        response = context['tool_vlm_client'].chat.completions.create(
-            model=context['model'],
+        response = context.get('vlm_client', context['tool_vlm_client']).chat.completions.create(
+            model=context.get('vlm_model', context['model']),
             messages=[{'role': 'user', 'content': content}],
             max_tokens=2048,
             temperature=0.0,
@@ -1725,16 +1729,27 @@ async def main():
         data_root, args.dataset, args.scene_name, args.question_id
     )
 
-    base_url = os.environ['AGENT_COT_REASONER_BASE_URL']
-    api_key = os.environ['AGENT_COT_REASONER_API_KEY']
-    model = os.environ['AGENT_COT_REASONER_MODEL']
-    sync_client = OpenAI(base_url=base_url, api_key=api_key, timeout=90.0, max_retries=2)
-    client = AsyncOpenAI(
-        base_url=base_url,
-        api_key=api_key,
-        timeout=90.0,
-        max_retries=2,
-    )
+    planner_endpoint = resolve_endpoint('planner')
+    vlm_endpoint = resolve_endpoint('vlm')
+    planner_client = create_async_client(planner_endpoint)
+    vlm_client = create_sync_client(vlm_endpoint)
+    model = planner_endpoint.model
+    base_url = vlm_endpoint.base_url
+    api_key = vlm_endpoint.api_key
+    sync_client = vlm_client
+    client = planner_client
+    planner_model = planner_endpoint.model
+    vlm_model = vlm_endpoint.model
+    print(f'[Agent] Planner endpoint: {json.dumps(planner_endpoint.describe())}', flush=True)
+    print(f'[Agent] VLM endpoint    : {json.dumps(vlm_endpoint.describe())}', flush=True)
+    if planner_endpoint.model == vlm_endpoint.model and (
+        planner_endpoint.base_url == vlm_endpoint.base_url
+    ):
+        print(
+            '[Agent] Planner and VLM share one model; set AGENT_PLANNER_* to '
+            'use a cheaper text-only model for planning.',
+            flush=True,
+        )
 
     print(f'[Agent] Question: {question["question"]}', flush=True)
     print(f'[Agent] Scene root: {scene_root}', flush=True)
@@ -1864,10 +1879,17 @@ async def main():
         'task_constraint': task_constraint_dict,
         'store': store,
         'device': args.device,
-        'tool_vlm_client': sync_client,
-        'model': model,
-        'base_url': base_url,
-        'api_key': api_key,
+        'tool_vlm_client': vlm_client,
+        'vlm_client': vlm_client,
+        'vlm_model': vlm_model,
+        'planner_model': planner_model,
+        'model': vlm_model,
+        'base_url': vlm_endpoint.base_url,
+        'api_key': vlm_endpoint.api_key,
+        'llm_endpoints': {
+            'planner': planner_endpoint.describe(),
+            'vlm': vlm_endpoint.describe(),
+        },
     }
     tool_synthesizer = (
         ToolSynthesizer(
@@ -1895,6 +1917,10 @@ async def main():
     print('[Agent] Starting Planner loop...', flush=True)
     result = await loop.run(question=plan['question'], plan=planner_plan)
     agent_memory.save(agent_memory_path)
+    result['llm_endpoints'] = {
+        'planner': planner_endpoint.describe(),
+        'vlm': vlm_endpoint.describe(),
+    }
     result['task_constraint'] = task_constraint_dict
     result['constraint_dir'] = str(
         scene_root / 'questions' / str(args.question_id)
