@@ -173,6 +173,92 @@ def is_evidence_candidate_frame(frame: FrameRecord) -> bool:
     return metadata.get('generated_by') in _LEGACY_EVIDENCE_SOURCES
 
 
+def cluster_positions_by_extent(
+    positions,
+    extents,
+    scale: float = 1.0,
+    fallback_eps: float = None,
+):
+    """Group observations that could be views of the same rigid object.
+
+    Two views are merged when their centroids are closer than the LARGER of the
+    two observed extents (``scale`` multiplies that).  The observed extent of a
+    patch is a lower bound on the object's size, so the larger of two views is
+    the better estimate of the scale to compare against; two centroids further
+    apart than the object itself cannot be the same object.
+
+    Replaces a global ``eps = 0.2 * object_scale``.  That chain - stored cloud
+    -> extent -> eps -> instance count - is fragile: when the cloud became one
+    partial view the estimated scale fell to 0.44 m, eps to 0.088 m, and
+    observations of four tables were split into six to eleven "tables".
+
+    Adding the two radii instead of taking the larger one is also too
+    permissive - it is the "bounding spheres just touch" test, which chains
+    neighbouring objects together (four tables collapsed into one).  On real
+    data the larger-extent rule is stable over scale in [1.0, 1.25] and does
+    not sit on a knife edge:
+
+        scale    chairs (gt 2)    tables (gt 4)
+        0.50          2               5
+        0.75          2               5
+        1.00          2               4
+        1.25          2               4
+        1.50          2               2
+    """
+    positions = [np.asarray(position, dtype=float) for position in positions]
+    if not positions:
+        return []
+    radii = []
+    for extent in extents:
+        if extent is None:
+            radii.append(0.0)
+            continue
+        radii.append(float(np.linalg.norm(np.asarray(extent, dtype=float))) / 2.0)
+
+    if not any(radius > 0 for radius in radii):
+        # Without a size for any observation there is no basis for the rule.
+        # Degenerating to "no merge at all" is what made counting return one
+        # instance per frame, so say so and fall back deliberately.
+        if fallback_eps:
+            print(
+                '[Tracks] no per-observation extent available; falling back to '
+                f'a distance threshold of {fallback_eps:.3f} m',
+                flush=True,
+            )
+            return cluster_positions_by_distance(positions, fallback_eps)
+        raise ValueError(
+            'cluster_positions_by_extent requires at least one observation '
+            'extent; refusing to guess (every observation would become its '
+            'own instance).'
+        )
+
+    parent = list(range(len(positions)))
+
+    def find(index):
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(a, b):
+        root_a, root_b = find(a), find(b)
+        if root_a != root_b:
+            parent[root_b] = root_a
+
+    for i in range(len(positions)):
+        for j in range(i + 1, len(positions)):
+            threshold = scale * max(radii[i], radii[j])
+            if threshold <= 0:
+                continue
+            if float(np.linalg.norm(positions[i] - positions[j])) <= threshold:
+                union(i, j)
+
+    clusters = {}
+    for index in range(len(positions)):
+        clusters.setdefault(find(index), []).append(index)
+    return list(clusters.values())
+
+
 def cluster_positions_by_distance(positions, eps: float):
     positions = [np.asarray(position, dtype=float) for position in positions]
     if not positions:

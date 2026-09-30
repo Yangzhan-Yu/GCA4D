@@ -3,6 +3,8 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
+from tools.utils.mask_metrics import mask_quality
+
 
 @dataclass
 class ObservationQuality:
@@ -12,6 +14,8 @@ class ObservationQuality:
     mask_boundary_ratio: float
     mask_bbox_coverage: float
     point_count: int
+    mask_touches_border: bool = False
+    mask_bbox_border_sides: int = 0
     confidence: Optional[float] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
@@ -27,33 +31,8 @@ class EvidenceStatus:
 
 
 def evaluate_mask_quality(mask: np.ndarray) -> Dict[str, float]:
-    mask = np.asarray(mask, dtype=bool)
-    height, width = mask.shape
-    area = int(mask.sum())
-    total = int(mask.size)
-    area_ratio = area / max(1, total)
-
-    boundary_width = max(1, int(min(height, width) * 0.02))
-    boundary_region = np.zeros_like(mask, dtype=bool)
-    boundary_region[:boundary_width, :] = True
-    boundary_region[-boundary_width:, :] = True
-    boundary_region[:, :boundary_width] = True
-    boundary_region[:, -boundary_width:] = True
-    boundary_pixels = int((mask & boundary_region).sum())
-    boundary_ratio = boundary_pixels / max(1, area)
-
-    rows, cols = np.where(mask)
-    if area == 0:
-        bbox_coverage = 0.0
-    else:
-        bbox_area = (rows.max() - rows.min() + 1) * (cols.max() - cols.min() + 1)
-        bbox_coverage = area / max(1, bbox_area)
-
-    return {
-        'mask_area_ratio': float(area_ratio),
-        'mask_boundary_ratio': float(boundary_ratio),
-        'mask_bbox_coverage': float(bbox_coverage),
-    }
+    """Shape statistics for a mask (see tools/utils/mask_metrics.py)."""
+    return mask_quality(mask)
 
 
 class EvidenceSufficiencyChecker:
@@ -64,17 +43,25 @@ class EvidenceSufficiencyChecker:
         min_mask_area_ratio: float = 0.003,
         max_boundary_ratio: float = 0.35,
         min_bbox_coverage: float = 0.20,
+        max_mask_border_sides: Optional[int] = None,
     ):
         self.min_observations_per_entity = min_observations_per_entity
         self.min_points_per_entity = min_points_per_entity
         self.min_mask_area_ratio = min_mask_area_ratio
         self.max_boundary_ratio = max_boundary_ratio
         self.min_bbox_coverage = min_bbox_coverage
+        self.max_mask_border_sides = max_mask_border_sides
 
     def assess_observation(self, observation: ObservationQuality) -> List[str]:
         reasons = []
         if observation.mask_area_ratio < self.min_mask_area_ratio:
             reasons.append('mask_area_too_small')
+        sides = int(getattr(observation, 'mask_bbox_border_sides', 0) or 0)
+        if (
+            self.max_mask_border_sides is not None
+            and sides > int(self.max_mask_border_sides)
+        ):
+            reasons.append('mask_clipped_by_frame_edge')
         if observation.mask_boundary_ratio > self.max_boundary_ratio:
             reasons.append('mask_touches_image_boundary')
         if observation.mask_bbox_coverage < self.min_bbox_coverage:

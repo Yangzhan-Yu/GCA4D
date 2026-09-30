@@ -1,11 +1,8 @@
 import argparse
-import base64
-import io
 import json
 import os
 import subprocess
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
@@ -17,7 +14,6 @@ from PIL import Image, ImageDraw
 import numpy as np
 import torch
 import torchvision
-from openai import OpenAI
 from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
 
 from sam2.build_sam import build_sam2
@@ -26,11 +22,15 @@ from vggt.models.vggt import VGGT
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
 from tools.apis.agent_memory import AgentMemory
-from tools.apis.api_budget import reserve_api_call
 from tools.apis.evidence_sufficiency import (
     EvidenceSufficiencyChecker,
     ObservationQuality,
     evaluate_mask_quality,
+)
+from tools.utils.mask_metrics import mask_rejection_reason
+from tools.apis.entity_detection_cache import (
+    CACHE_CANDIDATES,
+    EntityDetectionCache,
 )
 from tools.apis.four_d_memory import (
     CameraPose,
@@ -39,6 +39,7 @@ from tools.apis.four_d_memory import (
     MemoryObject,
     Observation,
     cluster_positions_by_distance,
+    cluster_positions_by_extent,
     is_evidence_candidate_frame,
     open_vsibench_memory,
 )
@@ -53,10 +54,7 @@ from tools.apis.keyframe_selector import (
     selected_to_dicts,
 )
 from tools.apis.vggt_model import load_and_preprocess_images
-from tools.apis.vlm_grounding import detect_entities_vlm
 from tools.utils.mm_utils import visualize_3d_object, visualize_3d_scene
-from tools.apis.llm_endpoint import resolve_endpoint
-from tools.utils.vlm_as_detector import qwen3_prompt
 
 
 GROUNDING_DINO_ID = 'IDEA-Research/grounding-dino-base'
@@ -91,9 +89,66 @@ def parse_args():
     parser.add_argument('--min-score', type=float, default=0.25)
     parser.add_argument('--min-support-frames', type=int, default=2)
     parser.add_argument('--min-visibility', type=float, default=0.2)
-    parser.add_argument('--detector', choices=['vlm', 'grounding_dino'], default='grounding_dino')
-    parser.add_argument('--vlm-workers', type=int, default=1)
-    parser.add_argument('--api-timeout', type=float, default=90.0)
+    parser.add_argument(
+        '--detector',
+        choices=['grounding_dino', 'sam3'],
+        default='grounding_dino',
+        help=(
+            'sam3 performs text-prompted detection AND segmentation in one '
+            'forward pass, replacing the grounding_dino + sam2 two-step. It '
+            'runs in a separate environment (torch>=2.7) via $PYTHON_SAM3.'
+        ),
+    )
+    parser.add_argument(
+        '--sam3-python', default=None,
+        help='Interpreter used for the SAM3 worker (default $PYTHON_SAM3).',
+    )
+    parser.add_argument('--sam3-confidence', type=float, default=0.5)
+    parser.add_argument('--sam3-resolution', type=int, default=1008)
+    parser.add_argument(
+        '--sam3-max-per-prompt', type=int, default=1,
+        help='Masks kept per prompt per frame before selection.',
+    )
+    parser.add_argument(
+        '--mask-boundary-max', type=float, default=None,
+        help=(
+            'Reject observations whose mask touches the image border on more '
+            'than this fraction of its perimeter. A clipped mask truncates any '
+            '3D extent measured from it. Declared by the task constraint.'
+        ),
+    )
+    parser.add_argument(
+        '--max-mask-border-sides', type=int, default=None,
+        help=(
+            'Reject observations whose mask bounding box is clipped by the '
+            'frame on more than this many sides (0-4). A truncated view gives '
+            'a truncated 3D extent, but large furniture seen close up is '
+            'routinely clipped, so the limit is per operation and distance '
+            'sets none. Declared by the task constraint.'
+        ),
+    )
+    parser.add_argument(
+        '--mask-coverage-min', type=float, default=None,
+        help=(
+            'Reject observations whose mask fills less than this fraction of '
+            'its own bounding box (fragmented / spill / reflection).'
+        ),
+    )
+    parser.add_argument(
+        '--refresh-detections', action='store_true',
+        help=(
+            'Ignore the shared per-entity detection cache and re-run the '
+            'detector. Use after changing detector settings, or when a cached '
+            'box looks wrong.'
+        ),
+    )
+    parser.add_argument(
+        '--entities', nargs='*', default=None,
+        help=(
+            "Restrict this pass to a subset of the question's entities. "
+            'Defaults to every entity in the evidence plan.'
+        ),
+    )
     parser.add_argument('--auto-expand', action='store_true')
     parser.add_argument('--round-index', type=int, default=0)
     parser.add_argument('--max-rounds', type=int, default=3)
@@ -101,6 +156,93 @@ def parse_args():
     parser.add_argument('--dry-run', action='store_true')
     return parser.parse_args()
 
+
+
+def run_sam3_batch(
+    frames: Sequence,
+    prompts: Sequence[str],
+    work_dir: Path,
+    device: str,
+    confidence: float,
+    resolution: int,
+    max_per_prompt: int,
+    python: str = None,
+) -> Dict[str, Dict[str, List[Dict]]]:
+    """Run the SAM3 batch worker in its own environment.
+
+    SAM3 needs torch>=2.7 while this pipeline runs on torch 2.5, so the model
+    is driven through a subprocess.  One process handles every frame, so the
+    checkpoint is loaded once per evidence-collection pass.
+    """
+    sam3_python = python or os.environ.get('PYTHON_SAM3')
+    if not sam3_python:
+        raise RuntimeError(
+            'The sam3 detector needs PYTHON_SAM3 (source scripts/gca_env.sh) '
+            'or --sam3-python.'
+        )
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    requests_path = work_dir / 'sam3_requests.json'
+    output_path = work_dir / 'sam3_results.json'
+    requests_path.write_text(
+        json.dumps(
+            {
+                'prompts': [str(item) for item in prompts],
+                'frames': [
+                    {'frame_id': frame.frame_id, 'image_path': str(frame.frame_path)}
+                    for frame in frames
+                ],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ) + '\n',
+        encoding='utf-8',
+    )
+
+    environment = dict(os.environ)
+    sam3_root = environment.get('SAM3_ROOT')
+    if sam3_root:
+        existing = environment.get('PYTHONPATH', '')
+        environment['PYTHONPATH'] = (
+            sam3_root + (os.pathsep + existing if existing else '')
+        )
+
+    command = [
+        sam3_python,
+        '-m',
+        'entrypoints.segment_with_sam3',
+        '--requests', str(requests_path),
+        '--output-json', str(output_path),
+        '--device', device,
+        '--confidence', str(confidence),
+        '--resolution', str(resolution),
+        '--max-per-prompt', str(max_per_prompt),
+    ]
+    print(f'[SAM3] Launching: {" ".join(command)}', flush=True)
+    completed = subprocess.run(
+        command,
+        cwd=str(Path(__file__).resolve().parents[1]),
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    for line in (completed.stdout or '').splitlines():
+        print(f'[SAM3] {line}', flush=True)
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f'SAM3 worker failed with returncode={completed.returncode}'
+        )
+    payload = json.loads(output_path.read_text(encoding='utf-8'))
+    results = payload.get('results') or {}
+    errors = payload.get('errors') or {}
+    print(
+        f'[SAM3] {len(results)} frame(s) with detections, '
+        f'{len(errors)} frame(s) failed',
+        flush=True,
+    )
+    return results
 
 def load_plan(scene_root: Path, question_id: int):
     plan_path = scene_root / 'question_plans' / f'{question_id}.json'
@@ -122,225 +264,6 @@ def unique_entities(plan: Dict) -> List[str]:
             if entity and entity not in entities:
                 entities.append(entity)
     return entities
-
-
-def image_to_data_uri(image: Image.Image) -> str:
-    buffer = io.BytesIO()
-    image.save(buffer, format='PNG')
-    encoded = base64.b64encode(buffer.getvalue()).decode('ascii')
-    return f'data:image/png;base64,{encoded}'
-
-
-def parse_vlm_detections(content: str, image: Image.Image):
-    import re
-    match = re.search(r'```json\s*([\s\S]*?)\s*```', content, re.DOTALL)
-    if not match:
-        return []
-    try:
-        records = json.loads(match.group(1))
-    except json.JSONDecodeError:
-        return []
-    width, height = image.size
-    boxes = []
-    for record in records:
-        bbox = record.get('bbox_2d')
-        if not bbox or len(bbox) != 4:
-            continue
-        x1 = int(float(bbox[0]) / 1000 * width)
-        y1 = int(float(bbox[1]) / 1000 * height)
-        x2 = int(float(bbox[2]) / 1000 * width)
-        y2 = int(float(bbox[3]) / 1000 * height)
-        x1, x2 = sorted((x1, x2))
-        y1, y2 = sorted((y1, y2))
-        boxes.append([x1, y1, x2, y2])
-    return boxes
-
-
-def parse_vlm_verification(content: str):
-    import re
-    match = re.search(r'```json\s*([\s\S]*?)\s*```', content, re.DOTALL)
-    raw = match.group(1) if match else content
-    try:
-        record = json.loads(raw)
-    except json.JSONDecodeError:
-        return False, 0.0, 'invalid_json'
-    valid = bool(record.get('valid', False))
-    confidence = float(record.get('confidence', 0.0))
-    category = str(record.get('category', 'unknown'))
-    return valid, confidence, category
-
-
-def verify_box_vlm(client, model, image: Image.Image, entity: str, bbox):
-    annotated = image.copy()
-    draw = ImageDraw.Draw(annotated)
-    x1, y1, x2, y2 = [int(value) for value in bbox]
-    draw.rectangle((x1, y1, x2, y2), outline=(255, 0, 0), width=5)
-    prompt = (
-        f'The red box is proposed as a "{entity}". Is it actually a valid {entity} '
-        'and is enough of the object visible for 3D measurement? '
-        'Reject partial boundary fragments, furniture floors/walls, pictures, or ambiguous objects. '
-        'Return one JSON object in a json code block: '
-        '{"valid": true/false, "category": "...", "confidence": 0.0-1.0, "reason": "..."}.'
-    )
-    reserve_api_call('collect_verify_box', {'entity': entity})
-    response = client.chat.completions.create(
-        model=model,
-        messages=[{
-            'role': 'user',
-            'content': [
-                {'type': 'text', 'text': prompt},
-                {'type': 'image_url', 'image_url': {'url': image_to_data_uri(annotated)}},
-            ],
-        }],
-        max_tokens=512,
-        temperature=0.0,
-        top_p=0.95,
-    )
-    return parse_vlm_verification(response.choices[0].message.content)
-
-
-def parse_category_classification(content: str):
-    import re
-    match = re.search(r'```json\s*([\s\S]*?)\s*```', content, re.DOTALL)
-    raw = match.group(1) if match else content
-    try:
-        record = json.loads(raw)
-    except json.JSONDecodeError:
-        return 'unknown', 0.0
-    return (
-        str(record.get('category', 'unknown')).strip().lower(),
-        float(record.get('confidence', 0.0)),
-    )
-
-
-def classify_bbox_vlm(client, model, image: Image.Image, bbox, entity: str):
-    x1, y1, x2, y2 = [int(value) for value in bbox]
-    width, height = image.size
-    margin_x = int(0.15 * max(1, x2 - x1))
-    margin_y = int(0.15 * max(1, y2 - y1))
-    crop = image.crop((
-        max(0, x1 - margin_x),
-        max(0, y1 - margin_y),
-        min(width, x2 + margin_x),
-        min(height, y2 + margin_y),
-    ))
-    prompt = (
-        f'Classify the main physical object in this cropped image. '
-        f'The candidate was proposed as "{entity}". Choose exactly one: '
-        'chair, sofa, stool, table, bed, other. '
-        'A chair is a single-person seat with a back. A sofa is multi-seat '
-        'seating or a couch; sofa cushions and sofa backs are not chairs. '
-        'Return one JSON object in a json code block: '
-        '{"category": "chair|sofa|stool|table|bed|other", '
-        '"confidence": 0.0-1.0, "reason": "..."}'
-    )
-    reserve_api_call('collect_classify_bbox', {'entity': entity})
-    response = client.chat.completions.create(
-        model=model,
-        messages=[{
-            'role': 'user',
-            'content': [
-                {'type': 'text', 'text': prompt},
-                {'type': 'image_url', 'image_url': {'url': image_to_data_uri(crop)}},
-            ],
-        }],
-        max_tokens=512,
-        temperature=0.0,
-        top_p=0.95,
-    )
-    return parse_category_classification(response.choices[0].message.content)
-
-
-def parse_multi_box_verification(content: str):
-    import re
-    match = re.search(r'```json\s*([\s\S]*?)\s*```', content, re.DOTALL)
-    raw = match.group(1) if match else content
-    try:
-        records = json.loads(raw)
-    except json.JSONDecodeError:
-        return {}
-    if isinstance(records, dict):
-        records = records.get('results', [])
-    output = {}
-    for record in records:
-        label = str(record.get('label', '')).strip().lower()
-        if not label:
-            continue
-        output[label] = (
-            bool(record.get('valid', False)),
-            float(record.get('confidence', 0.0)),
-            str(record.get('category', 'unknown')).strip().lower(),
-        )
-    return output
-
-
-def verify_boxes_vlm(client, model, image: Image.Image, detections: Dict):
-    if not detections:
-        return {}
-    annotated = image.copy()
-    draw = ImageDraw.Draw(annotated)
-    items = list(detections.items())
-    for index, (entity, detection) in enumerate(items):
-        bbox = detection['bbox']
-        x1, y1, x2, y2 = [int(value) for value in bbox]
-        draw.rectangle((x1, y1, x2, y2), outline=(255, 0, 0), width=5)
-        draw.text((x1 + 3, max(0, y1 + 3)), f'{index}:{entity}', fill=(255, 255, 0))
-    prompt = (
-        'The image contains numbered red boxes. For every numbered box, decide '
-        'whether it is a valid, fully visible instance of the labeled category. '
-        'Reject furniture fragments, floors, walls, pictures, reflections, and '
-        'objects that merely resemble the target. Return a JSON array. Each item '
-        'must have this format: '
-        '{"label": "category", "valid": true/false, '
-        '"category": "actual_category", "confidence": 0.0-1.0, '
-        '"reason": "brief reason"}'
-    )
-    reserve_api_call(
-        'collect_verify_boxes',
-        {'entities': list(detections.keys())},
-    )
-    response = client.chat.completions.create(
-        model=model,
-        messages=[{
-            'role': 'user',
-            'content': [
-                {'type': 'text', 'text': prompt},
-                {'type': 'image_url', 'image_url': {'url': image_to_data_uri(annotated)}},
-            ],
-        }],
-        max_tokens=1024,
-        temperature=0.0,
-        top_p=0.95,
-    )
-    return parse_multi_box_verification(response.choices[0].message.content)
-
-
-def detect_best_box_vlm(client, model, image: Image.Image, entity: str):
-    prompt = (
-        qwen3_prompt(entity)
-        + ' Return at most one bounding box for the most visible instance '
-          'of the requested category. If the category is not visible, return [].'
-    )
-    reserve_api_call('collect_detect_best_box', {'entity': entity})
-    response = client.chat.completions.create(
-        model=model,
-        messages=[{
-            'role': 'user',
-            'content': [
-                {'type': 'text', 'text': prompt},
-                {'type': 'image_url', 'image_url': {'url': image_to_data_uri(image)}},
-            ],
-        }],
-        max_tokens=1024,
-        temperature=0.0,
-        top_p=0.95,
-    )
-    boxes = parse_vlm_detections(response.choices[0].message.content, image)
-    if not boxes:
-        return None
-    areas = [max(0, box[2] - box[0]) * max(0, box[3] - box[1]) for box in boxes]
-    best_index = int(np.argmax(areas))
-    return boxes[best_index], 1.0
 
 
 def detect_best_box_dino(model, processor, image: Image.Image, entity: str, device, threshold):
@@ -620,8 +543,40 @@ def main():
         scene_root = results_root / args.dataset / args.scene_name
         plan_path, plan = load_plan(scene_root, args.question_id)
     entities = unique_entities(plan)
+    if args.entities:
+        requested = [str(item).strip().lower() for item in args.entities if str(item).strip()]
+        missing = [item for item in requested if item not in entities]
+        if missing:
+            print(
+                f'[Entities] {missing} are not in the evidence plan for this '
+                'question; ignoring them.',
+                flush=True,
+            )
+        selected = [item for item in requested if item in entities]
+        if selected:
+            entities = selected
     if not entities:
         raise ValueError('Evidence plan contains no target/reference entities')
+
+    # How good the masks have to be depends on what the question does with
+    # them: counting only needs the object located, while size/distance lift the
+    # mask to 3D and measure it.  The cache is shared either way - only the
+    # choice among cached candidates differs.
+    MEASURE_QUESTION_TYPES = {
+        'object_size_estimation',
+        'object_abs_distance',
+        'object_rel_distance',
+        'room_size_estimation',
+    }
+    question_type = str(plan.get('question_type') or '').strip()
+    if question_type in MEASURE_QUESTION_TYPES:
+        mask_purpose = 'measure'
+    elif question_type.startswith('object_rel_direction'):
+        mask_purpose = 'orient'
+    else:
+        mask_purpose = 'locate'
+    print(f'[Detect] mask purpose={mask_purpose} (question_type={question_type!r})',
+          flush=True)
 
     store = open_vsibench_memory(
         data_root=data_root,
@@ -667,22 +622,7 @@ def main():
             )
 
     device = torch.device(args.device)
-    vlm_client, vlm_model = None, None
     processor, detector = None, None
-    vlm_endpoint = resolve_endpoint('vlm', required=args.detector == 'vlm')
-    if vlm_endpoint is not None:
-        vlm_model = vlm_endpoint.model
-        vlm_client = OpenAI(
-            base_url=vlm_endpoint.base_url,
-            api_key=vlm_endpoint.api_key,
-            timeout=args.api_timeout,
-            max_retries=5,
-        )
-        print(f'[VLM] Endpoint: {vlm_endpoint.describe()}', flush=True)
-    if args.detector == 'vlm' and vlm_client is None:
-        raise ValueError(
-            'VLM detector requires AGENT_VLM_* or AGENT_COT_REASONER_* variables'
-        )
     if args.detector == 'grounding_dino':
         processor = AutoProcessor.from_pretrained(GROUNDING_DINO_ID, cache_dir=CACHE_DIR, local_files_only=True)
         detector = AutoModelForZeroShotObjectDetection.from_pretrained(
@@ -701,7 +641,12 @@ def main():
         metadata = frame.metadata or {}
         cached_detections = metadata.get('detections')
         cached_visibility = metadata.get('visibility')
-        if cached_detections is not None and cached_visibility is not None:
+        cached_source = metadata.get('detection_source')
+        if (
+            cached_detections is not None
+            and cached_visibility is not None
+            and cached_source == args.detector
+        ):
             filtered_detections = {}
             filtered_visibility = {}
             for entity in entities:
@@ -739,51 +684,53 @@ def main():
                 frame_path=frame.frame_path,
                 visibility=cached_visibility,
                 sharpness=sharpness_score(image),
-                metadata={'detections': cached_detections},
+                metadata={
+                    'detections': cached_detections,
+                    'reused_cache': True,
+                },
             )
         detections = {}
         visibility = {}
-        if args.detector == 'vlm' and vlm_client is not None:
-            print(
-                f'scoring frame={frame.frame_id} entities={entities}',
-                flush=True,
-            )
-            batch_detections = detect_entities_vlm(
-                vlm_client,
-                vlm_model,
-                image,
-                entities,
-                verify_detections=False,
-            )
-            batch_verification = verify_boxes_vlm(
-                vlm_client,
-                vlm_model,
-                image,
-                batch_detections,
-            )
+        if args.detector == 'sam3':
+            hits_by_entity = sam3_cache.get(frame.frame_id, {})
             for entity in entities:
-                detection = batch_detections.get(entity)
-                if detection is None:
+                override = detection_overrides.get(frame.frame_id, {}).get(entity)
+                if override:
+                    bbox = override['bbox']
+                    score = float(override.get('score', 1.0))
+                    detections[entity] = {
+                        'bbox': bbox,
+                        'score': score,
+                        'verified_category': entity,
+                        'source': 'planner_disambiguation',
+                    }
+                    visibility[entity] = (
+                        bbox_visibility(bbox, image.size) * max(0.1, score)
+                    )
+                    continue
+                hits = hits_by_entity.get(entity) or []
+                if not hits:
                     visibility[entity] = 0.0
                     continue
-                bbox = detection['bbox']
-                score = float(detection.get('score', 1.0))
-                valid, verify_confidence, verified_category = (
-                    batch_verification.get(entity, (False, 0.0, 'unknown'))
-                )
-                if not valid or verified_category.lower() != entity.lower():
+                best = EntityDetectionCache.select_candidate(hits, mask_purpose)
+                if best is None:
                     visibility[entity] = 0.0
                     continue
-                score = min(score, verify_confidence)
-
                 detections[entity] = {
-                    **detection,
-                    'bbox': bbox,
-                    'score': score,
+                    'bbox': [float(v) for v in best['bbox']],
+                    'score': float(best['score']),
                     'verified_category': entity,
+                    'mask_path': best.get('mask_path'),
+                    'mask_area_ratio': best.get('mask_area_ratio'),
+                    'mask_boundary_ratio': best.get('mask_boundary_ratio'),
+                    'mask_bbox_coverage': best.get('mask_bbox_coverage'),
+                    'mask_purpose': mask_purpose,
+                    'candidates_considered': len(hits),
+                    'source': 'sam3',
                 }
                 visibility[entity] = (
-                    bbox_visibility(bbox, image.size) * max(0.1, score)
+                    bbox_visibility(detections[entity]['bbox'], image.size)
+                    * max(0.1, float(best['score']))
                 )
         else:
             raw_detections = {}
@@ -841,19 +788,119 @@ def main():
             metadata={'detections': detections},
         )
 
+    mask_rejections: Dict[str, List[Dict]] = {entity: [] for entity in entities}
+    sam3_cache: Dict[str, Dict[str, List[Dict]]] = {}
+    if args.detector == 'sam3' and not args.selection_only and not args.dry_run:
+        # Locating an entity in a frame does not depend on the question, so
+        # results are shared across questions in the same scene.  The key
+        # includes the detector configuration: swapping the detector without
+        # changing the key is how a stale box replaced a correct one before.
+        cache = EntityDetectionCache(args.dataset, args.scene_name)
+        # max_per_prompt is NOT part of the key: it changes how many of the
+        # masks we keep, not what the model produces.  Keying on it would make
+        # a stricter question re-run the detector for results we already have.
+        cache_config = {
+            'detector': 'sam3',
+            'confidence': float(args.sam3_confidence),
+            'resolution': int(args.sam3_resolution),
+        }
+        keep = max(int(args.sam3_max_per_prompt), CACHE_CANDIDATES)
+        if args.refresh_detections:
+            for entity in entities:
+                cache.invalidate(entity)
+            print('[Cache] --refresh-detections: re-running every entity.',
+                  flush=True)
+        cached = cache.load_for_entities(entities, cache_config)
+        cached_counts = {e: len(v) for e, v in cached.items()}
+        if any(cached_counts.values()):
+            print(f'[Cache] hit for {cached_counts} (key={cache_config})', flush=True)
+
+        all_ids = [frame.frame_id for frame in all_frames]
+        todo_ids = set()
+        for entity in entities:
+            hits = cached.get(entity) or {}
+            todo_ids.update(fid for fid in all_ids if fid not in hits)
+        todo = [f for f in all_frames if f.frame_id in todo_ids]
+        if len(todo) < len(all_frames):
+            print(
+                f'[Cache] {len(all_frames) - len(todo)}/{len(all_frames)} '
+                'frame(s) fully cached; re-running detection only where needed.',
+                flush=True,
+            )
+
+        fresh: Dict[str, Dict[str, List[Dict]]] = {}
+        if todo:
+            fresh = run_sam3_batch(
+                frames=todo,
+                prompts=entities,
+                work_dir=scene_root / 'evidence' / 'sam3',
+                device=args.device,
+                confidence=args.sam3_confidence,
+                resolution=args.sam3_resolution,
+                max_per_prompt=keep,
+                python=args.sam3_python,
+            )
+            for entity in entities:
+                updates = {
+                    fid: (frame_result.get(entity) or [])
+                    for fid, frame_result in fresh.items()
+                }
+                updates = {k: v for k, v in updates.items() if v}
+                cache.store(entity, cache_config, updates)
+
+        # Re-read so this pass sees cache hits and fresh results alike, and
+        # refresh any frame that was not requested this round.
+        for entity in entities:
+            merged = dict(cached.get(entity) or {})
+            for fid, frame_result in fresh.items():
+                hits = frame_result.get(entity) or []
+                if hits:
+                    merged[fid] = hits
+            for fid in all_ids:
+                if fid not in merged:
+                    continue
+                sam3_cache.setdefault(fid, {})[entity] = merged[fid]
+
+    if args.detector == 'sam3' and not args.selection_only and not args.dry_run:
+        print(
+            f'[Cache] after this pass: {cache.summarize(entities, cache_config)}',
+            flush=True,
+        )
+        # With the entity cache, sam3_results.json only holds the frames this
+        # pass had to detect.  Write what was actually fed into scoring so the
+        # evidence directory stays interpretable.
+        used_path = scene_root / 'evidence' / 'sam3' / 'detections_used.json'
+        used_path.parent.mkdir(parents=True, exist_ok=True)
+        used_path.write_text(
+            json.dumps(
+                {
+                    'prompts': entities,
+                    'mask_purpose': mask_purpose,
+                    'cache_config': cache_config,
+                    'frames_scored': len(sam3_cache),
+                    'cache_state': cache.summarize(entities, cache_config),
+                    'results': sam3_cache,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ) + '\n',
+            encoding='utf-8',
+        )
+
     scored_candidates = {}
-    if vlm_client is not None and args.vlm_workers > 1:
-        with ThreadPoolExecutor(max_workers=args.vlm_workers) as executor:
-            future_to_frame = {
-                executor.submit(score_frame, frame): frame
-                for frame in all_frames
-            }
-            for future in as_completed(future_to_frame):
-                frame = future_to_frame[future]
-                scored_candidates[frame.frame_id] = future.result()
-    else:
-        for frame in all_frames:
-            scored_candidates[frame.frame_id] = score_frame(frame)
+    for frame in all_frames:
+        scored_candidates[frame.frame_id] = score_frame(frame)
+
+    reused = sum(
+        1 for candidate in scored_candidates.values()
+        if (candidate.metadata or {}).get('reused_cache')
+    )
+    if reused:
+        print(
+            f'[Intermediate] reused {reused}/{len(scored_candidates)} frame(s) '
+            f'with cached {args.detector} detections.',
+            flush=True,
+        )
 
     candidates = [scored_candidates[frame.frame_id] for frame in all_frames]
     for candidate in candidates:
@@ -1018,9 +1065,18 @@ def main():
     frame_records = []
     object_points_accum = {entity: [] for entity in entities}
     object_colors_accum = {entity: [] for entity in entities}
+    object_positions_accum = {entity: [] for entity in entities}
 
-    sam2_model = build_sam2(SAM2_CONFIG, SAM2_CHECKPOINT, device=args.device)
-    sam2_predictor = SAM2ImagePredictor(sam2_model)
+    # SAM2 is only needed for boxes that did not come with a mask (planner
+    # overrides, or the grounding_dino path).  Build it lazily so a pure SAM3
+    # run never pays for it.
+    _sam2_holder: Dict[str, object] = {'predictor': None}
+
+    def get_sam2_predictor():
+        if _sam2_holder['predictor'] is None:
+            sam2_model = build_sam2(SAM2_CONFIG, SAM2_CHECKPOINT, device=args.device)
+            _sam2_holder['predictor'] = SAM2ImagePredictor(sam2_model)
+        return _sam2_holder['predictor']
 
     for geometry_index, (selected_item, frame) in enumerate(zip(selected, selected_frames)):
         image = Image.open(frame.frame_path).convert('RGB')
@@ -1030,16 +1086,65 @@ def main():
             continue
         detection_image = detection_dir / f'{frame.frame_id}_detections.jpg'
         draw_detection_overlay(image, detections, detection_image)
-        sam2_predictor.set_image(np.asarray(image))
+        needs_sam2 = [
+            entity for entity, detection in detections.items()
+            if not (
+                detection.get('mask_path')
+                and Path(str(detection['mask_path'])).exists()
+            )
+        ]
+        if needs_sam2:
+            sam2_predictor = get_sam2_predictor()
+            sam2_predictor.set_image(np.asarray(image))
         for entity, detection in detections.items():
             bbox = np.asarray(detection['bbox'], dtype=np.float32)
-            mask, mask_scores, _ = sam2_predictor.predict(
-                point_coords=None, point_labels=None,
-                box=bbox[None, :], multimask_output=False,
-            )
-            mask = np.asarray(mask[0], dtype=bool)
+            cached_mask_path = detection.get('mask_path')
+            if cached_mask_path and Path(str(cached_mask_path)).exists():
+                # SAM3 produced the mask together with the box.
+                mask = np.asarray(
+                    Image.open(str(cached_mask_path)).convert('L')
+                ) > 127
+                sam_score = float(detection.get('score', 1.0))
+            else:
+                sam2_predictor = get_sam2_predictor()
+                mask, mask_scores, _ = sam2_predictor.predict(
+                    point_coords=None, point_labels=None,
+                    box=bbox[None, :], multimask_output=False,
+                )
+                mask = np.asarray(mask[0], dtype=bool)
+                sam_score = (
+                    float(mask_scores[0]) if len(mask_scores)
+                    else detection['score']
+                )
             masks[entity] = mask
-            sam_score = float(mask_scores[0]) if len(mask_scores) else detection['score']
+
+            # Enforce the task's mask bar *before* lifting to 3D, so a clipped
+            # or fragmented mask never enters the point cloud.  Counting sets
+            # no bar; size and distance do, because they measure the object.
+            mask_stats = evaluate_mask_quality(mask)
+            rejection = mask_rejection_reason(
+                mask_stats,
+                args.mask_boundary_max,
+                args.mask_coverage_min,
+                max_mask_border_sides=args.max_mask_border_sides,
+            )
+            if rejection is not None:
+                mask_rejections.setdefault(entity, []).append({
+                    'frame_id': frame.frame_id,
+                    'reason': rejection,
+                    'mask_boundary_ratio': mask_stats['mask_boundary_ratio'],
+                    'mask_bbox_coverage': mask_stats['mask_bbox_coverage'],
+                    'mask_touches_border': mask_stats['mask_touches_border'],
+                    'mask_bbox_border_sides': mask_stats['mask_bbox_border_sides'],
+                })
+                print(
+                    f'[Mask] {frame.frame_id} {entity}: rejected ({rejection}) '
+                    f'boundary={mask_stats["mask_boundary_ratio"]:.2f} '
+                    f'coverage={mask_stats["mask_bbox_coverage"]:.2f}',
+                    flush=True,
+                )
+                continue
+
             mask_path = mask_dir / f'{frame.frame_id}_{entity}_mask.png'
             Image.fromarray((mask.astype(np.uint8) * 255)).save(mask_path)
 
@@ -1066,6 +1171,7 @@ def main():
             position = np.median(selected_points, axis=0)
             object_points_accum[entity].append(selected_points)
             object_colors_accum[entity].append(selected_colors)
+            object_positions_accum[entity].append(position.tolist())
 
             observation_id = f'q{args.question_id}_{frame.frame_id}_{entity}'
             observations_dir = geometry_dir / 'observations'
@@ -1090,24 +1196,39 @@ def main():
                 mask_path=str(mask_path),
                 position_3d=position.tolist(),
                 confidence=min(detection['score'], sam_score),
-                source='question_vlm+sam2+vggt',
+                source=(
+                    'question_sam3+vggt'
+                    if detection.get('source') == 'sam3'
+                    else 'question_dino+sam2+vggt'
+                ),
                 metadata={
                     'question_id': args.question_id,
                     'selection_score': selected_item.score,
                     'selection_reason': selected_item.reason,
                     'mask_score': sam_score,
                     'point_count': int(len(selected_points)),
+                    # The extent of THIS view.  Track clustering needs it to
+                    # decide whether two observations could be the same rigid
+                    # object; without it every observation became its own
+                    # instance and counting returned one per frame.
+                    'point_extent': (
+                        selected_points.max(axis=0) - selected_points.min(axis=0)
+                    ).astype(float).tolist(),
                     'geometry_index': geometry_index,
                     'pointcloud_path': str(observation_points_path),
                 },
             ))
-            mask_quality = evaluate_mask_quality(mask)
+            mask_quality = mask_stats
             observation_quality_by_entity[entity].append(ObservationQuality(
                 entity=entity,
                 frame_id=frame.frame_id,
                 mask_area_ratio=mask_quality['mask_area_ratio'],
                 mask_boundary_ratio=mask_quality['mask_boundary_ratio'],
                 mask_bbox_coverage=mask_quality['mask_bbox_coverage'],
+                mask_touches_border=bool(mask_quality.get('mask_touches_border')),
+                mask_bbox_border_sides=int(
+                    mask_quality.get('mask_bbox_border_sides') or 0
+                ),
                 point_count=int(len(selected_points)),
                 confidence=min(detection['score'], sam_score),
                 metadata={
@@ -1141,8 +1262,70 @@ def main():
     for entity, chunks in object_points_accum.items():
         if not chunks:
             continue
-        points = np.concatenate(chunks, axis=0)
-        point_colors = np.concatenate(object_colors_accum[entity], axis=0)
+        colors_chunks = object_colors_accum[entity]
+        positions = object_positions_accum[entity]
+
+        # An object's point cloud must come from views that agree on where the
+        # object is.  Observations whose centroids sit far apart are either a
+        # different instance or mis-registered by VGGT over a long time span;
+        # concatenating them inflates every measurement.  Measured on a real
+        # scene, three "stove" observations sat 0.33-0.63 m apart - as far apart
+        # as the 0.6 m appliance itself - and their union measured 186 cm.
+        selected_chunks = list(range(len(chunks)))
+        cluster_report = {'clusters': 1, 'used': len(chunks), 'excluded': 0}
+        if len(chunks) > 1 and len(positions) == len(chunks):
+            probe = np.concatenate(chunks, axis=0)
+            probe_extent = (probe.max(axis=0) - probe.min(axis=0)).astype(float)
+            # Deliberately the DISTANCE rule here, not the extent rule: for
+            # the stored cloud we want only mutually consistent views, so a
+            # tight threshold is the point.  The extent rule is used for
+            # deciding how many instances exist, where over-merging is the risk.
+            eps = max(0.05, 0.2 * float(np.linalg.norm(probe_extent)))
+            clusters = cluster_positions_by_distance(positions, eps)
+            if len(clusters) > 1:
+                # Rank by internal agreement first, data volume second.
+                #
+                # A cluster whose observations disagree about where the object
+                # is stretches the union, so every measured extent comes out
+                # too large: two "stove" views 0.18 m apart on a 0.6 m
+                # appliance gave raw 80.6 / percentile 57.7 / obb 88.7 cm, all
+                # three unreliable, while the single coherent view gave a
+                # stable 48.5-60.6 cm.  When observations DO agree they tie on
+                # agreement and the extra points win, so coverage is not lost.
+                def agreement(indices):
+                    if len(indices) < 2:
+                        return 1.0
+                    centroids = np.asarray([positions[i] for i in indices], float)
+                    spread = float(np.linalg.norm(centroids.max(axis=0) - centroids.min(axis=0)))
+                    joined = np.concatenate([chunks[i] for i in indices], axis=0)
+                    extent = float(np.linalg.norm(joined.max(axis=0) - joined.min(axis=0)))
+                    return 1.0 - spread / max(extent, 1e-6)
+
+                def cluster_rank(indices):
+                    points_total = sum(len(chunks[i]) for i in indices)
+                    return (round(agreement(indices), 3), points_total)
+
+                best = max(clusters, key=cluster_rank)
+                selected_chunks = sorted(best)
+                cluster_report = {
+                    'clusters': len(clusters),
+                    'used': len(selected_chunks),
+                    'excluded': len(chunks) - len(selected_chunks),
+                    'eps_m': eps,
+                    'agreement': round(agreement(best), 3),
+                }
+                print(
+                    f'[Cloud] {entity}: {len(clusters)} spatially separate '
+                    f'observation cluster(s); using the most coherent one '
+                    f'({len(selected_chunks)}/{len(chunks)} observations, '
+                    f'agreement={agreement(best):.2f}, eps={eps:.3f}m).',
+                    flush=True,
+                )
+
+        points = np.concatenate([chunks[i] for i in selected_chunks], axis=0)
+        point_colors = np.concatenate(
+            [colors_chunks[i] for i in selected_chunks], axis=0
+        )
         finite = np.isfinite(points).all(axis=1)
         points = points[finite]
         point_colors = point_colors[finite]
@@ -1156,6 +1339,7 @@ def main():
             points.max(axis=0) - points.min(axis=0)
         ).astype(float).tolist()
         objects[entity].metadata['point_extent'] = point_extent
+        objects[entity].metadata['cloud_clusters'] = cluster_report
 
         observations_with_position = [
             observation
@@ -1165,11 +1349,28 @@ def main():
             if observation.position_3d is not None
         ]
         if observations_with_position:
-            object_scale = float(np.linalg.norm(np.asarray(point_extent)))
-            eps = max(0.05, 0.2 * object_scale)
-            clusters = cluster_positions_by_distance(
+            # Per-pair rule: see cluster_positions_by_extent.  A global eps
+            # derived from the stored cloud's extent over-split the tracks
+            # whenever that cloud happened to be one partial view.
+            observation_extents = [
+                (observation.metadata or {}).get('point_extent')
+                or (observation.metadata or {}).get('extent')
+                for observation in observations_with_position
+            ]
+            union_positions = np.asarray(
                 [observation.position_3d for observation in observations_with_position],
-                eps,
+                dtype=float,
+            )
+            span = union_positions.max(axis=0) - union_positions.min(axis=0)
+            clusters = cluster_positions_by_extent(
+                union_positions,
+                observation_extents,
+                fallback_eps=max(0.05, 0.2 * float(np.linalg.norm(span))),
+            )
+            print(
+                f'[Tracks] {entity}: {len(clusters)} instance cluster(s) from '
+                f'{len(observations_with_position)} observation(s).',
+                flush=True,
             )
             for cluster_index, indices in enumerate(clusters):
                 track_id = f'{entity}_{cluster_index:02d}'
@@ -1183,9 +1384,30 @@ def main():
             objects[entity].metadata['track_eps'] = eps
         store.upsert_object(objects[entity])
 
+    rejected = {e: len(v) for e, v in mask_rejections.items() if v}
+    if rejected:
+        print(
+            f'[Mask] rejected {sum(rejected.values())} observation(s) that '
+            f'failed the {mask_purpose} bar: {rejected}',
+            flush=True,
+        )
+
     checker = EvidenceSufficiencyChecker(
         min_observations_per_entity=args.min_support_frames,
         min_points_per_entity=1000,
+        # Same bar as the collection filter, taken from the task constraint.
+        # Otherwise counting - which declares no bar - would still be rejected
+        # here by the checker's built-in shape defaults.
+        max_boundary_ratio=(
+            args.mask_boundary_max if args.mask_boundary_max is not None else 1.0
+        ),
+        min_bbox_coverage=(
+            args.mask_coverage_min if args.mask_coverage_min is not None else 0.0
+        ),
+        max_mask_border_sides=(
+            args.max_mask_border_sides
+            if args.max_mask_border_sides is not None else 4
+        ),
     )
     evidence_status = checker.check(
         required_entities=entities,
@@ -1310,7 +1532,7 @@ def main():
         <section><h2>Frame {record['frame_id']} | t={record['timestamp']:.2f}s</h2>
         <p>selection: {record['selection'].reason}, score={record['selection'].score:.3f}</p>
         <div style="display:flex;gap:16px;flex-wrap:wrap">
-        <figure><img src="{rel_detection}" width="420"><figcaption>VLM grounding</figcaption></figure>
+        <figure><img src="{rel_detection}" width="420"><figcaption>GroundingDINO detection</figcaption></figure>
         <figure><img src="{rel_mask}" width="420"><figcaption>SAM2 mask</figcaption></figure>
         </div><pre>{json.dumps(record['detections'], ensure_ascii=False, indent=2)}</pre></section>
         """)

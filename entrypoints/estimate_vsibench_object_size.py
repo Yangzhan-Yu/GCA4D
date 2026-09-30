@@ -59,29 +59,6 @@ def obb_extent(points: np.ndarray, lower: float, upper: float):
     return np.sort(projected_max - projected_min)[::-1]
 
 
-def load_points_for_track(store, object_id: str, track_id: str | None):
-    observations = store.query_observations(object_id=object_id)
-    if track_id is not None:
-        observations = [
-            observation for observation in observations
-            if (observation.metadata or {}).get('track_id') == track_id
-        ]
-    chunks = []
-    used_observations = []
-    for observation in observations:
-        path_value = (observation.metadata or {}).get('pointcloud_path')
-        if not path_value:
-            continue
-        path = Path(path_value)
-        if not path.exists():
-            continue
-        chunks.append(np.load(path)['points'].astype(np.float32))
-        used_observations.append(observation)
-    if chunks:
-        return np.concatenate(chunks, axis=0), used_observations, 'observation_chunks'
-    return None, used_observations, 'observation_chunks'
-
-
 def main():
     args = parse_args()
     entity = str(args.entity).strip().lower()
@@ -107,18 +84,30 @@ def main():
         raise ValueError(f'No object evidence found for entity: {entity}')
     obj = objects[0]
 
-    raw_points, used_observations, source = load_points_for_track(
-        store,
-        obj.object_id,
-        args.track_id,
-    )
-    if raw_points is None:
-        raw_points_path = store.root_dir / 'geometry' / f'{obj.object_id}_points.npz'
-        if not raw_points_path.exists():
-            raise FileNotFoundError(f'Object point cloud not found: {raw_points_path}')
-        raw_points = np.load(raw_points_path)['points'].astype(np.float32)
-        used_observations = store.query_observations(object_id=obj.object_id)
-        source = 'combined_fallback'
+    # Always measure the object's aggregated point cloud, never a single
+    # track subset.
+    #
+    # ``track_id`` used to filter the observations, and the tool then wrote the
+    # scaled subset over ``{object_id}_points_metric.npz``.  That file is the
+    # object's shared metric cloud - the constraint's object_extent reads it -
+    # so a 1575-point track silently replaced a 23708-point aggregate and the
+    # extent came out unstable (raw 45.8 / percentile 42.2 / obb 55.5 on a
+    # 62 cm stove, all three wrong).
+    #
+    # Per-track geometry belongs to the track machinery, not to this tool.
+    raw_points_path = store.root_dir / 'geometry' / f'{obj.object_id}_points.npz'
+    if not raw_points_path.exists():
+        raise FileNotFoundError(f'Object point cloud not found: {raw_points_path}')
+    raw_points = np.load(raw_points_path)['points'].astype(np.float32)
+    used_observations = store.query_observations(object_id=obj.object_id)
+    source = 'combined'
+    if args.track_id:
+        print(
+            f'[Size] track_id={args.track_id!r} ignored for the measurement; '
+            f'using all {len(used_observations)} observation(s) of '
+            f'{obj.object_id} ({len(raw_points)} points).',
+            flush=True,
+        )
 
     evidence_dir = scene_root / 'evidence'
     metric_scale = estimate_metric_scale(
@@ -167,7 +156,8 @@ def main():
     object_size_result = {
         'object_id': obj.object_id,
         'entity': entity,
-        'track_id': args.track_id,
+        'track_id': obj.object_id,
+        'track_id_requested': args.track_id,
         'requested_method': args.method,
         'source': source,
         'observation_count': len(used_observations),
