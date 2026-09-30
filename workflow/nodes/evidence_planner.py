@@ -5,6 +5,11 @@ from typing import Any, Dict, List, Optional
 from workflow.prompts.evidence_planner import build_evidence_planner_prompt
 from workflow.utils.parse_utils import parse_json_str
 from tools.apis.api_budget import reserve_api_call
+from tools.apis.llm_endpoint import (
+    async_chat_text,
+    planner_max_tokens,
+    request_extra,
+)
 
 
 @dataclass
@@ -88,14 +93,18 @@ class QuestionEvidencePlanner:
             options=options,
         )
         reserve_api_call('evidence_planner')
-        response = await self.client.chat.completions.create(
+        # Goes through the shared helper so it gets the same thinking control
+        # and <think> stripping as the tool-selection loop.  A local hybrid
+        # Qwen3 reasons by default, and its <think> block is not valid JSON.
+        content = await async_chat_text(
+            self.client,
             model=self.model,
             messages=[{'role': 'user', 'content': prompt}],
-            max_tokens=2048,
+            max_tokens=planner_max_tokens(2048),
             temperature=0.0,
             top_p=0.95,
+            extra=request_extra(),
         )
-        content = response.choices[0].message.content
         return parse_evidence_request(content)
 
 

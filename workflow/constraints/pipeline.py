@@ -87,6 +87,35 @@ def load_pointcloud(store_root, object_id: str, metric: bool = True) -> Optional
     return None
 
 
+def available_geometry_ids(store_root) -> List[str]:
+    """Object ids that actually have a point cloud on disk.
+
+    Not every id in the memory store has geometry: ``query_tracks`` also
+    returns observation sub-tracks (``sofa_01`` ...) that are never written as
+    separate point clouds.  Validation must use this list, not the store's
+    object table and certainly not the bindings themselves.
+    """
+    geometry_dir = Path(store_root) / 'geometry'
+    ids = set()
+    if geometry_dir.exists():
+        for path in geometry_dir.glob('*_points_metric.npz'):
+            ids.add(path.name[: -len('_points_metric.npz')])
+        for path in geometry_dir.glob('*_points.npz'):
+            ids.add(path.name[: -len('_points.npz')])
+    return sorted(ids)
+
+
+def geometry_categories(store_root) -> List[str]:
+    """Category names that have a point cloud on disk."""
+    categories = set()
+    for object_id in available_geometry_ids(store_root):
+        if '_' in object_id:
+            categories.add(object_id.rsplit('_', 1)[0])
+        else:
+            categories.add(object_id)
+    return sorted(categories)
+
+
 def geometry_version(store_root, object_ids: List[str]) -> str:
     """A digest that changes whenever the underlying geometry changes."""
     parts = []
@@ -112,6 +141,8 @@ def build_context(
     points: Optional[Dict[str, Any]] = None,
     metric_scale: Optional[Dict[str, Any]] = None,
     coordinate_frame_id: Optional[str] = None,
+    available_object_ids: Optional[List[str]] = None,
+    available_categories: Optional[List[str]] = None,
     extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     data = as_dict(constraint)
@@ -123,13 +154,21 @@ def build_context(
         for value in bindings.values()
         if isinstance(value, str) and value
     ]
+    if available_object_ids is None:
+        # Fall back to the binding targets.  Callers that have a store should
+        # pass available_geometry_ids(store_root) instead, otherwise the
+        # availability check below can never fail.
+        available_object_ids = object_ids
     context: Dict[str, Any] = {
         'entity_bindings': bindings,
         'points': points,
         'metric_scale': metric_scale or {},
         'coordinate_frame_id': coordinate_frame_id or (data.get('reference_frame') or {}).get('coordinate_frame_id'),
         'geometry_version': geometry_version(store_root, object_ids),
-        'available_object_ids': sorted(set(object_ids)),
+        'available_object_ids': sorted(set(str(v) for v in available_object_ids)),
+        'available_categories': sorted(
+            {str(v).strip().lower() for v in (available_categories or []) if str(v).strip()}
+        ),
     }
     if extra:
         context.update(extra)
@@ -245,4 +284,6 @@ __all__ = [
     'log_repair',
     'load_pointcloud',
     'geometry_version',
+    'available_geometry_ids',
+    'geometry_categories',
 ]

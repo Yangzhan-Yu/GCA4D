@@ -4,7 +4,12 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from workflow.constraints.operations import OperationSpec, OPERATION_SPECS, infer_operation
+from workflow.constraints.operations import (
+    MASK_QUALITY_REQUIREMENTS,
+    OperationSpec,
+    OPERATION_SPECS,
+    infer_operation,
+)
 
 
 @dataclass
@@ -52,6 +57,12 @@ class EvidenceConstraint:
     min_points_per_track: int = 0
     coordinate_frame_required: bool = True
     quality_flags: List[str] = field(default_factory=list)
+    # A mask that is cut off by the image border, or fragmented, produces an
+    # incomplete point cloud.  Counting only needs the object located, so it
+    # sets no bar; anything that measures the object does.
+    max_mask_boundary_ratio: Optional[float] = None
+    min_mask_bbox_coverage: Optional[float] = None
+    max_mask_border_sides: Optional[int] = None
 
 
 @dataclass
@@ -190,6 +201,14 @@ def compile_task_constraint(plan: Dict[str, Any]) -> TaskConstraint:
         plan.get('relation_or_metric', ''),
     )
     operation_spec: OperationSpec = OPERATION_SPECS.get(operation_name)
+    unsupported_operation = None
+    if operation_spec is not None and not operation_spec.implemented:
+        # Declared in the vocabulary but not executable yet: leave the
+        # constraint without an operation so the Planner falls back to
+        # open-ended tool use and the answer gate stays disabled.
+        unsupported_operation = operation_spec.name
+        operation_name = None
+        operation_spec = None
     entities = _build_entities(
         operation=operation_name,
         question=question,
@@ -243,10 +262,26 @@ def compile_task_constraint(plan: Dict[str, Any]) -> TaskConstraint:
             min_observations_per_track=1,
             min_points_per_track=0,
             coordinate_frame_required=operation_name not in {'count_instances', 'first_visible_order'},
+            max_mask_border_sides=(
+                MASK_QUALITY_REQUIREMENTS.get(operation_name, {}).get(
+                    'max_mask_border_sides'
+                )
+            ),
+            max_mask_boundary_ratio=(
+                MASK_QUALITY_REQUIREMENTS.get(operation_name, {}).get(
+                    'max_mask_boundary_ratio'
+                )
+            ),
+            min_mask_bbox_coverage=(
+                MASK_QUALITY_REQUIREMENTS.get(operation_name, {}).get(
+                    'min_mask_bbox_coverage'
+                )
+            ),
         ),
         metadata={
             'relation_or_metric': plan.get('relation_or_metric'),
             'reasoning': plan.get('reasoning'),
+            'unsupported_operation': unsupported_operation,
         },
     )
 

@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from workflow.constraints.operations import CATEGORY_ROLES
 from workflow.constraints.pipeline import load_pointcloud, question_dir
 
 # Roles that hold point-cloud evidence.
@@ -29,15 +30,53 @@ METRIC_OPERATIONS = {
 }
 
 
+# A track counts as a distinct physical instance when it was seen in more
+# than one frame, or when a single-frame detection was confident.
+#
+# The old rule also required >= 5000 points for a single-frame track.  That is
+# a property of how large the object looks, not of whether it is real, and it
+# silently dropped a 0.945-confidence chair that occupied a small part of the
+# frame - turning a correct count of 2 into 1.  Detection confidence is the
+# signal that actually separates a real single-frame object from a false
+# positive.
+MIN_TRACK_SUPPORT = 2
+MIN_SINGLE_FRAME_CONFIDENCE = 0.70
+
+
+def is_reliable_track(
+    track: Dict[str, Any],
+    min_support: int = MIN_TRACK_SUPPORT,
+    min_single_frame_confidence: float = MIN_SINGLE_FRAME_CONFIDENCE,
+) -> bool:
+    support = len(track.get('frame_ids') or [])
+    if support >= min_support:
+        return True
+    confidence = float(track.get('mean_confidence') or 0.0)
+    return confidence >= min_single_frame_confidence
+
+
+def reliable_tracks(tracks, **kwargs) -> List[Dict[str, Any]]:
+    return [track for track in tracks if is_reliable_track(track, **kwargs)]
+
+
 def default_bindings(constraint: Dict[str, Any]) -> Dict[str, str]:
-    """One candidate binding per role, derived from the constraint's entities."""
+    """One candidate binding per role, derived from the constraint's entities.
+
+    Instance roles bind to ``<category>_00``; category roles (``category``,
+    ``categories``) bind to the category name itself, because those operations
+    span every instance of the category.  Binding a category role to an
+    instance id would silently match zero tracks.
+    """
     bindings: Dict[str, str] = {}
     for entity in constraint.get('entities', []):
         role = str(entity.get('role', '')).strip()
         category = str(entity.get('category', '')).strip().lower()
         if not role or not category:
             continue
-        bindings.setdefault(role, f'{category}_00')
+        if role in CATEGORY_ROLES:
+            bindings.setdefault(role, category)
+        else:
+            bindings.setdefault(role, f'{category}_00')
     return bindings
 
 
@@ -122,10 +161,10 @@ def resolve_extra_inputs(
     extra: Dict[str, Any] = {}
     if operation == 'count_instances':
         category = bindings.get('category')
-        tracks: List[Dict[str, Any]] = []
+        raw_tracks: List[Dict[str, Any]] = []
         if store is not None and category:
             for track in store.query_tracks(category=str(category)):
-                tracks.append({
+                raw_tracks.append({
                     'track_id': track.get('track_id'),
                     'support': len(track.get('frame_ids') or []),
                     'total_points': track.get('total_points'),
@@ -133,7 +172,14 @@ def resolve_extra_inputs(
                     'frame_ids': track.get('frame_ids') or [],
                     'centroid': track.get('centroid'),
                 })
-        extra['tracks'] = tracks
+        # Reliability policy carried over from the former
+        # count_entities_in_video tool: a track counts if it is seen in more
+        # than one frame, or is dense enough and confident enough in a single
+        # frame.  Both the filtered and unfiltered counts are reported so a
+        # disagreement is visible instead of silent.
+        reliable = reliable_tracks(raw_tracks)
+        extra['tracks'] = reliable or raw_tracks
+        extra['tracks_all'] = raw_tracks
     if operation == 'first_visible_order':
         intervals = {}
         if store is not None:
@@ -145,8 +191,13 @@ def resolve_extra_inputs(
                 ]
                 intervals[str(category)] = min(times) if times else None
         extra['time_intervals'] = intervals
+    # 'method' is deliberately NOT taken from args: the caller overrides it
+    # from the evidence profile so the measurement method cannot vary per call.
     if 'method' in args:
-        extra['method'] = args['method']
+        print(
+            f'[Profile] ignoring Planner-supplied method={args["method"]!r}',
+            flush=True,
+        )
     if 'vertical_axis' in args:
         extra['vertical_axis'] = args['vertical_axis']
     if 'direction_boundaries' in args:
@@ -163,4 +214,8 @@ __all__ = [
     'resolve_extra_inputs',
     'POINT_ROLES',
     'METRIC_OPERATIONS',
+    'is_reliable_track',
+    'reliable_tracks',
+    'MIN_TRACK_SUPPORT',
+    'MIN_SINGLE_FRAME_CONFIDENCE',
 ]

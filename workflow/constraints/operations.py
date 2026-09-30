@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+import re
 from typing import Any, Dict, List, Optional
 
 
@@ -9,6 +10,10 @@ class OperationSpec:
     required_inputs: List[str] = field(default_factory=list)
     required_evidence: List[str] = field(default_factory=list)
     description: str = ''
+    # False = declared in the operation vocabulary but not executable yet.
+    # Such questions fall back to open-ended tool use instead of failing with
+    # an opaque "empty point cloud" error.
+    implemented: bool = True
 
 
 OPERATION_SPECS: Dict[str, OperationSpec] = {
@@ -60,6 +65,7 @@ OPERATION_SPECS: Dict[str, OperationSpec] = {
         required_inputs=['room_region'],
         required_evidence=['3d_points', 'metric_scale', 'room_region'],
         description='Metric area of the visible room/floor region.',
+        implemented=False,
     ),
     'route_turns': OperationSpec(
         name='route_turns',
@@ -67,7 +73,66 @@ OPERATION_SPECS: Dict[str, OperationSpec] = {
         required_inputs=['start', 'heading', 'landmarks', 'route'],
         required_evidence=['scene_graph', 'coordinate_frame'],
         description='Turn sequence for navigation between bound landmarks.',
+        implemented=False,
     ),
+}
+
+
+# Roles that bind to a category *name* (e.g. "chair") rather than to a
+# concrete instance id (e.g. "chair_00").  Counting and timeline operations
+# operate on every instance of a category, so there is no single instance to
+# bind.
+CATEGORY_ROLES = {'category', 'categories'}
+
+# Leading option marker: "A. ", "B) ", "(C) ", "1. "
+_OPTION_MARKER = re.compile(r'^\s*[\(\[]?[A-Za-z0-9][\)\].:]\s*')
+
+
+def strip_option_marker(option: str) -> str:
+    """Option text without its leading marker: ``'A. left'`` -> ``'left'``."""
+    return _OPTION_MARKER.sub('', str(option)).strip()
+
+
+# How good a mask has to be, per operation.  Missing entry = no bar.
+#
+#   locate  (count_instances, first_visible_order) - the object only has to be
+#           found, so any mask works.
+#   measure (object_extent, surface_distance, argmin_distance, room_area) - the
+#           mask is lifted to 3D and measured.  A mask clipped by the image
+#           border truncates the extent, and a fragmented one (spill,
+#           reflection, occlusion) gives a partial point cloud.
+#   orient  (relative_direction) - only the centroid matters, so the bar sits
+#           between the two: a partly clipped object still has a usable centre.
+MASK_QUALITY_REQUIREMENTS: Dict[str, Dict[str, Any]] = {
+    # An extent is the max dimension of the point cloud, so a clipped view
+    # truncates it.  Reject only badly clipped views: measured on a real scene,
+    # requiring "fully inside the frame" rejected 12 of 13 sofa views and left
+    # no point cloud at all.
+    'object_extent': {
+        'max_mask_border_sides': 2,
+        'min_mask_bbox_coverage': 0.50,
+    },
+    # The closest-surface distance only needs the surfaces facing the other
+    # object.  Large furniture seen up close is routinely clipped, so a
+    # truncation limit here rejects everything and the question becomes
+    # unanswerable.  Fragmentation still disqualifies a mask.
+    'surface_distance': {
+        'max_mask_border_sides': 4,
+        'min_mask_bbox_coverage': 0.40,
+    },
+    'argmin_distance': {
+        'max_mask_border_sides': 4,
+        'min_mask_bbox_coverage': 0.40,
+    },
+    'room_area': {
+        'max_mask_border_sides': 4,
+        'min_mask_bbox_coverage': 0.30,
+    },
+    # Direction uses the centroid, so a clipped view still has a usable centre.
+    'relative_direction': {
+        'max_mask_border_sides': 2,
+        'min_mask_bbox_coverage': 0.35,
+    },
 }
 
 
@@ -93,4 +158,11 @@ def infer_operation(question_type: str, relation_or_metric: str = '') -> Optiona
     return None
 
 
-__all__ = ['OperationSpec', 'OPERATION_SPECS', 'infer_operation']
+__all__ = [
+    'OperationSpec',
+    'OPERATION_SPECS',
+    'CATEGORY_ROLES',
+    'MASK_QUALITY_REQUIREMENTS',
+    'strip_option_marker',
+    'infer_operation',
+]

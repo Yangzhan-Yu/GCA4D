@@ -1,7 +1,6 @@
 import argparse
 import asyncio
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -16,16 +15,10 @@ from tools.apis.api_budget import (
     ApiBudgetExceeded,
     configure_api_budget,
     get_api_budget,
-    reserve_api_call,
 )
-from tools.apis.vlm_grounding import image_to_data_uri
+from tools.apis.entity_detection_cache import EntityDetectionCache
 from tools.apis.grounding_dino_local import GroundingDinoDetector
-from tools.apis.llm_endpoint import (
-    async_chat_text,
-    create_async_client,
-    create_sync_client,
-    resolve_endpoint,
-)
+from tools.apis.llm_endpoint import create_async_client, resolve_endpoint
 from tools.apis.four_d_memory import (
     CONTEXT_FRAME_ROLE,
     EVIDENCE_FRAME_ROLE,
@@ -40,6 +33,8 @@ from tools.apis.temporal_neighbor_search import (
 )
 from workflow.agentic.planner_loop import PlannerLoop
 from workflow.constraints.pipeline import (
+    available_geometry_ids,
+    geometry_categories,
     build_context as build_constraint_context,
     load_constraint,
     load_result_store,
@@ -47,12 +42,14 @@ from workflow.constraints.pipeline import (
     save_constraint,
 )
 from workflow.constraints.runtime import (
+    is_reliable_track,
     load_bindings,
     merge_bindings,
     resolve_extra_inputs,
     resolve_points,
     save_bindings,
 )
+from workflow.constraints.evidence_profile import evidence_profile_for
 from workflow.constraints.task_constraints import compile_task_constraint
 from workflow.constraints.validator import validate_operation as validate_op
 from workflow.constraints.validator import validate_result as validate_res
@@ -62,7 +59,6 @@ from workflow.agentic.tool_synthesizer import (
 )
 from workflow.nodes.evidence_planner import QuestionEvidencePlanner
 from workflow.agentic.tool_registry import ToolRegistry, ToolSpec
-from workflow.utils.parse_utils import parse_json_str
 
 
 def parse_args():
@@ -151,6 +147,66 @@ def run_subprocess(command, cwd):
     }
 
 
+def mask_threshold_args(context: Dict[str, Any]) -> list:
+    """Forward the task's mask bar to the evidence collector.
+
+    The constraint declares how good a mask has to be (counting: any; size and
+    distance: not clipped, not fragmented).  Enforcing it in the collector
+    means a bad mask never becomes part of a point cloud that gets measured.
+    """
+    evidence = (context.get('task_constraint') or {}).get('evidence') or {}
+    argv = []
+    boundary = evidence.get('max_mask_boundary_ratio')
+    coverage = evidence.get('min_mask_bbox_coverage')
+    sides = evidence.get('max_mask_border_sides')
+    if sides is not None:
+        argv += ['--max-mask-border-sides', str(sides)]
+    if boundary is not None:
+        argv += ['--mask-boundary-max', str(boundary)]
+    if coverage is not None:
+        argv += ['--mask-coverage-min', str(coverage)]
+    return argv
+
+
+def pinned(context: Dict[str, Any], name: str, default: Any = None) -> Any:
+    """A sampling parameter, taken from the pinned profile.
+
+    Tools accept these from the Planner for compatibility but must not act on
+    them: letting the model choose produced a different frame set - and a
+    different measurement - on every run.
+    """
+    profile = context.get('evidence_profile') or {}
+    value = profile.get(name)
+    return default if value is None else value
+
+
+def effective_bridge_window(
+    requested_start: float,
+    requested_end: float,
+    suggestion,
+    respect_requested: bool = False,
+):
+    """Widen a requested bridge window to the scanned visibility interval.
+
+    The reconstruction needs the whole interval in which each object is
+    visible: a short burst of near-identical frames gives no camera baseline,
+    so the object is rebuilt from one viewpoint and its point cloud comes out
+    incomplete.  The Planner is asked to pass the suggested window through, but
+    a smaller model will sometimes pick one short interval instead.
+
+    Returns ``(start, end, widened)``.
+    """
+    if respect_requested or not suggestion:
+        return requested_start, requested_end, False
+    sug_start = suggestion.get('start_time')
+    sug_end = suggestion.get('end_time')
+    if sug_start is None or sug_end is None:
+        return requested_start, requested_end, False
+    start = min(float(requested_start), float(sug_start))
+    end = max(float(requested_end), float(sug_end))
+    return start, end, (start != float(requested_start) or end != float(requested_end))
+
+
 def load_plan(scene_root: Path, question_id: int):
     path = scene_root / 'question_plans' / f'{question_id}.json'
     if not path.exists():
@@ -169,8 +225,9 @@ def register_tools(registry: ToolRegistry):
         entities = [str(item).strip().lower() for item in args.get('entities', [])]
         if not entities:
             return {'error': 'entities must not be empty'}
-        stride = float(args.get('scan_stride_seconds', 4.0))
-        max_frames = int(args.get('max_scan_frames', 80))
+        # Sampling parameters come from the pinned profile, not the Planner.
+        stride = float(pinned(context, 'scan_stride_seconds', 4.0))
+        max_frames = int(pinned(context, 'max_scan_frames', 80))
         store = context['store']
         video_path = str(
             context['data_root'] / 'videos' / context['dataset'] /
@@ -200,13 +257,49 @@ def register_tools(registry: ToolRegistry):
             confidence = max(0.0, min(1.0, float(detection.get('score', 1.0))))
             return confidence * min(1.0, (area_fraction / 0.08) ** 0.5)
 
+        # Locating an entity in a frame does not depend on the question, so
+        # the scan is cached per (scene, frame, entity, detector settings) and
+        # shared across questions.  Only the frames x entities still missing
+        # reach GroundingDINO.
+        scan_cache = EntityDetectionCache(context['dataset'], context['scene_name'])
+        scan_config = {
+            'detector': 'grounding_dino',
+            'threshold': 0.2,
+            'text_threshold': 0.3,
+            'nms_threshold': 0.5,
+        }
+        cache_hits = 0
+        cache_misses = 0
+
         for item in extracted:
             image = Image.open(item['frame_path']).convert('RGB')
             detector = context.get('grounding_dino_detector')
             if detector is None:
                 detector = GroundingDinoDetector(device=context['device'])
                 context['grounding_dino_detector'] = detector
-            detections = detector.detect(image, entities)
+
+            detections = {}
+            missing = []
+            for entity in entities:
+                hit = scan_cache.get(entity, scan_config, item['frame_id'])
+                if hit is not None:
+                    cache_hits += 1
+                    if hit:
+                        detections[entity] = dict(hit[0])
+                else:
+                    missing.append(entity)
+            if missing:
+                cache_misses += len(missing)
+                fresh = detector.detect(image, missing)
+                for entity in missing:
+                    found = fresh.get(entity)
+                    scan_cache.put(
+                        entity, scan_config, item['frame_id'],
+                        [found] if found else [],
+                    )
+                    if found:
+                        detections[entity] = found
+
             frame_visibility = {entity: 0.0 for entity in entities}
             for entity in entities:
                 detection = detections.get(entity)
@@ -232,6 +325,11 @@ def register_tools(registry: ToolRegistry):
                 metadata={
                     'generated_by': 'scan_entity_visibility',
                     'role': VISIBILITY_SCAN_FRAME_ROLE,
+                    # Record which detector produced these boxes.  Downstream
+                    # stages must only reuse them when they would have run the
+                    # same detector, otherwise a GroundingDINO box silently
+                    # replaces e.g. a SAM3 mask.
+                    'detection_source': 'grounding_dino',
                     'visibility': frame_visibility,
                     'detections': detections,
                 },
@@ -272,32 +370,88 @@ def register_tools(registry: ToolRegistry):
             for entity, payload in result.items()
             if payload['anchor_frame_id'] is not None
         ]
+        # The bridge window must cover the whole span in which each entity is
+        # visible.
+        #
+        # Two earlier attempts were both too narrow.  Using only the anchor
+        # timestamps gave a window that closed just as the target came into
+        # view; using the single longest interval still sampled one burst when
+        # the object appears intermittently - the stove here is visible in
+        # [8,32], [40,44], [64,88], [100,116] ... and picking [8,32] left it
+        # with one observation and an extent of 40.8 cm instead of ~60.
+        #
+        # The stride guard in find_bridge_frames caps the frame count, so
+        # covering the full span is affordable.
+        best_intervals = {}
+        for entity, payload in result.items():
+            intervals = payload.get('intervals') or []
+            first = payload.get('first_seen')
+            last = payload.get('last_seen')
+            if intervals:
+                span_start = float(min(pair[0] for pair in intervals))
+                span_end = float(max(pair[1] for pair in intervals))
+                if first is not None:
+                    span_start = min(span_start, float(first))
+                if last is not None:
+                    span_end = max(span_end, float(last))
+                best_intervals[entity] = [span_start, span_end]
+            elif payload.get('anchor_timestamp') is not None:
+                stamp = float(payload['anchor_timestamp'])
+                best_intervals[entity] = [stamp, stamp]
+
         suggested_bridge_window = None
-        if len(anchor_frames) >= 2:
+        if best_intervals:
+            start = min(pair[0] for pair in best_intervals.values())
+            end = max(pair[1] for pair in best_intervals.values())
             suggested_bridge_window = {
-                'start_time': min(item['timestamp'] for item in anchor_frames),
-                'end_time': max(item['timestamp'] for item in anchor_frames),
+                'start_time': start,
+                'end_time': end,
+                'span_seconds': end - start,
+                'per_entity_interval': best_intervals,
                 'anchor_frame_ids': [
                     item['frame_id'] for item in anchor_frames
                 ],
                 'anchors': anchor_frames,
+                'note': (
+                    'Covers the full span in which every required entity is '
+                    'visible, so intermittently visible objects are sampled in '
+                    'each of their intervals. Do not narrow this to the anchor '
+                    'timestamps or to a single interval.'
+                ),
             }
-        return {
+        print(
+            f'[Cache] visibility scan: {cache_hits} entity-frame hit(s), '
+            f'{cache_misses} detected',
+            flush=True,
+        )
+        payload = {
             'visibility': result,
             'scanned_frames': len(extracted),
             'suggested_bridge_window': suggested_bridge_window,
+            'detection_cache': {'hits': cache_hits, 'misses': cache_misses},
         }
+        # Persist it so find_bridge_frames can enforce it.  The Planner is
+        # asked to pass the suggestion through, but a smaller local model will
+        # sometimes pick one short interval instead - and that silently costs
+        # the reconstruction its camera baseline.
+        evidence_dir = context['scene_root'] / 'evidence'
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        (evidence_dir / 'visibility_scan.json').write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + '\n',
+            encoding='utf-8',
+        )
+        return payload
 
     def find_bridge_frames(context: Dict[str, Any], **args):
-        start_time = float(args['start_time'])
-        end_time = float(args['end_time'])
-        interval = float(args.get('interval_seconds', 3.0))
-        padding = float(args.get('padding_seconds', 1.0))
+        # The window is whatever the visibility scan recorded.  A Planner-chosen
+        # window made the frames - and therefore the measurement - vary between
+        # runs of the same question; only respect_requested_window opts out.
+        interval = float(pinned(context, 'bridge_interval_seconds', 3.0))
+        padding = float(pinned(context, 'bridge_padding_seconds', 1.0))
+        max_frames = int(pinned(context, 'max_bridge_frames', 40))
         anchor_frame_ids = [
             str(value) for value in args.get('anchor_frame_ids', [])
         ]
-        if end_time <= start_time:
-            return {'error': 'end_time must be greater than start_time'}
         store = context['store']
         video_path = str(
             context['data_root'] / 'videos' / context['dataset'] /
@@ -312,13 +466,110 @@ def register_tools(registry: ToolRegistry):
             if frame_id in frames_by_id
             and frames_by_id[frame_id].timestamp is not None
         ]
-        window_start = max(0.0, start_time - padding)
-        window_end = end_time + padding
-        timestamps = list(anchor_timestamps)
-        current = window_start
-        while current <= window_end:
-            timestamps.append(current)
-            current += interval
+        scan = read_json(
+            context['scene_root'] / 'evidence' / 'visibility_scan.json', {}
+        ) or {}
+        suggestion = scan.get('suggested_bridge_window') or {}
+        if bool(args.get('respect_requested_window')) and 'start_time' in args:
+            start_time = float(args['start_time'])
+            end_time = float(args['end_time'])
+        elif suggestion.get('start_time') is not None:
+            start_time = float(suggestion['start_time'])
+            end_time = float(suggestion['end_time'])
+        elif 'start_time' in args:
+            start_time = float(args['start_time'])
+            end_time = float(args['end_time'])
+        else:
+            return {
+                'error': (
+                    'No visibility scan recorded. Call scan_entity_visibility '
+                    'first so the bridge window is derived from where the '
+                    'entities are actually visible.'
+                )
+            }
+        if end_time <= start_time:
+            return {'error': 'end_time must be greater than start_time'}
+        start_time, end_time, widened = effective_bridge_window(
+            start_time,
+            end_time,
+            suggestion,
+            respect_requested=bool(args.get('respect_requested_window')),
+        )
+        if widened:
+            print(
+                f'[Bridge] Requested window was narrower than the scanned '
+                f'visibility interval; widened to {start_time:.0f}-'
+                f'{end_time:.0f}s so each object keeps its camera baseline.',
+                flush=True,
+            )
+
+        # Sample INSIDE the visibility intervals, not uniformly across the
+        # span.  Uniform sampling spends its budget on stretches where nothing
+        # is visible and forces a wide stride, so consecutive frames end up
+        # seconds apart with no overlap - which is what made the reconstruction
+        # degrade.
+        interval_plan = []
+        for entity_name, payload in (scan.get('visibility') or {}).items():
+            if entity_name not in set(anchor_frame_ids or []) | set(
+                (scan.get('visibility') or {}).keys()
+            ):
+                continue
+            for start, end in (payload.get('intervals') or []):
+                lo = max(start_time, float(start) - padding)
+                hi = min(end_time, float(end) + padding)
+                if hi > lo:
+                    interval_plan.append((lo, hi))
+        interval_plan.sort()
+
+        if interval_plan:
+            # The reported window is the span the intervals cover; the actual
+            # timestamps come from the intervals themselves.
+            window_start = max(0.0, min(lo for lo, _ in interval_plan) - padding)
+            window_end = max(hi for _, hi in interval_plan) + padding
+
+            # Widen the stride only if the in-interval sample would exceed the
+            # frame budget; the coverage that survives is still all inside
+            # visible stretches.
+            def count_at(step):
+                return sum(int((hi - lo) / step) + 1 for lo, hi in interval_plan)
+
+            requested_interval = interval
+            while interval < (end_time - start_time) and count_at(interval) > max_frames:
+                interval *= 1.5
+            if interval != requested_interval:
+                print(
+                    f'[Bridge] {len(interval_plan)} visible interval(s); '
+                    f'widening stride {requested_interval:.1f}s -> '
+                    f'{interval:.1f}s to stay under {max_frames} frames.',
+                    flush=True,
+                )
+            timestamps = list(anchor_timestamps)
+            for lo, hi in interval_plan:
+                current = lo
+                while current <= hi:
+                    timestamps.append(current)
+                    current += interval
+        else:
+            # No per-entity intervals recorded: fall back to the plain window.
+            window_start = max(0.0, start_time - padding)
+            window_end = end_time + padding
+            requested_interval = interval
+            while interval < (window_end - window_start) and (
+                (window_end - window_start) / interval + 1
+            ) > max_frames:
+                interval *= 1.5
+            if interval != requested_interval:
+                print(
+                    f'[Bridge] Window {window_start:.0f}-{window_end:.0f}s is '
+                    f'wide; widening stride {requested_interval:.1f}s -> '
+                    f'{interval:.1f}s to stay under {max_frames} frames.',
+                    flush=True,
+                )
+            timestamps = list(anchor_timestamps)
+            current = window_start
+            while current <= window_end:
+                timestamps.append(current)
+                current += interval
         extracted = extract_video_frames_at_timestamps(
             video_path=video_path,
             frame_dir=context['scene_root'] / 'frames' / 'bridge_frames',
@@ -348,6 +599,8 @@ def register_tools(registry: ToolRegistry):
             'bridge_frame_paths': [item['frame_path'] for item in extracted],
             'window_start': window_start,
             'window_end': window_end,
+            'requested_window': [start_time, end_time],
+            'window_widened': widened,
             'anchor_frame_ids': anchor_frame_ids,
         }
 
@@ -433,85 +686,6 @@ def register_tools(registry: ToolRegistry):
             'overrides_path': str(overrides_path),
         }
 
-    def verify_candidate(context: Dict[str, Any], **args):
-        frame_id = str(args.get('frame_id', '')).strip()
-        entity = str(args.get('entity', '')).strip().lower()
-        bbox = args.get('bbox')
-        if not frame_id or not entity:
-            return {'error': 'frame_id and entity are required'}
-        store = context['store']
-        frame = next(
-            (item for item in store.query_frames() if item.frame_id == frame_id),
-            None,
-        )
-        if frame is None:
-            return {'error': f'Frame not found in memory: {frame_id}'}
-        if bbox is None:
-            detection = (
-                (frame.metadata or {})
-                .get('detections', {})
-                .get(entity)
-            )
-            if detection is None:
-                return {'error': f'No bbox available for {frame_id}/{entity}'}
-            bbox = detection['bbox']
-        image = Image.open(frame.frame_path).convert('RGB')
-        x1, y1, x2, y2 = [int(value) for value in bbox]
-        annotated = image.copy()
-        draw = ImageDraw.Draw(annotated)
-        draw.rectangle((x1, y1, x2, y2), outline=(255, 0, 0), width=5)
-        crop = image.crop((max(0, x1), max(0, y1), min(image.width, x2), min(image.height, y2)))
-        prompt = (
-            f'Check whether the red box in the full image contains a valid '
-            f'"{entity}" suitable for 3D reconstruction. The cropped region is '
-            'also shown. Reject if it is a different object category, a partial '
-            'fragment, furniture background, reflection, or too ambiguous. '
-            'Return one JSON object in a json code block: '
-            '{"valid": true/false, "category": "...", "confidence": 0.0-1.0, '
-            '"reason": "..."}'
-        )
-        reserve_api_call(
-            'qwen_check_candidate',
-            {'frame_id': frame_id, 'entity': entity},
-        )
-        response = context.get('vlm_client', context['tool_vlm_client']).chat.completions.create(
-            model=context.get('vlm_model', context['model']),
-            messages=[{
-                'role': 'user',
-                'content': [
-                    {'type': 'text', 'text': prompt},
-                    {'type': 'image_url', 'image_url': {'url': image_to_data_uri(annotated)}},
-                    {'type': 'image_url', 'image_url': {'url': image_to_data_uri(crop)}},
-                ],
-            }],
-            max_tokens=512,
-            temperature=0.0,
-            top_p=0.95,
-        )
-        raw_response = response.choices[0].message.content
-        try:
-            result, _ = parse_json_str(raw_response)
-        except Exception as exc:
-            return {
-                'error': f'Failed to parse checker response: {exc}',
-                'raw_response': raw_response,
-            }
-        result = {
-            **result,
-            'frame_id': frame_id,
-            'entity': entity,
-            'bbox': bbox,
-            'raw_response': raw_response,
-        }
-        output_dir = context['scene_root'] / 'evidence' / 'candidate_checks'
-        output_dir.mkdir(parents=True, exist_ok=True)
-        (output_dir / f'{frame_id}_{entity}.json').write_text(
-            json.dumps(result, ensure_ascii=False, indent=2) + '\n',
-            encoding='utf-8',
-        )
-        return result
-
-
     def check_evidence(context: Dict[str, Any]):
         path = context['scene_root'] / 'evidence' / 'evidence_status.json'
         status = read_json(path)
@@ -524,8 +698,13 @@ def register_tools(registry: ToolRegistry):
     def find_temporal_neighbors(context: Dict[str, Any], **args):
         entity = args.get('entity')
         anchor_ids = args.get('anchor_frame_ids', [])
-        offsets = args.get('offsets_seconds', [-1.0, -0.5, 0.5, 1.0])
-        max_per_anchor = int(args.get('max_frames_per_anchor', 4))
+        # Fixed offsets: the Planner was choosing these too, which changed
+        # which frames were extracted between runs of the same question.
+        offsets = [
+            float(value)
+            for value in pinned(context, 'neighbor_offsets_seconds', [])
+        ] or [-1.0, -0.5, 0.5, 1.0]
+        max_per_anchor = int(pinned(context, 'max_frames_per_anchor', 4))
         store = context['store']
         all_frames = store.query_frames()
         frames_by_id = {frame.frame_id: frame for frame in all_frames}
@@ -582,14 +761,25 @@ def register_tools(registry: ToolRegistry):
             '--question-id', str(context['question_id']),
             '--data-root', str(context['data_root']),
             '--results-root', str(context['results_root']),
-            '--detector', str(args.get('detector', 'grounding_dino')),
-            '--top-k', str(args.get('top_k', 6)),
-            '--min-temporal-gap', str(args.get('min_temporal_gap', 5)),
-            '--min-joint-visibility', str(args.get('min_joint_visibility', 0.25)),
-            '--min-support-frames', str(args.get('min_support_frames', 2)),
-            '--min-visibility', str(args.get('min_visibility', 0.2)),
-            '--vlm-workers', str(args.get('vlm_workers', 2)),
+            '--detector', str(pinned(context, 'detector', 'sam3')),
+            *mask_threshold_args(context),
+            '--top-k', str(pinned(context, 'top_k_frames', 8)),
+            '--min-temporal-gap', str(pinned(context, 'min_temporal_gap', 5.0)),
+            '--min-joint-visibility', str(
+                pinned(context, 'min_joint_visibility', 0.25)
+            ),
+            '--min-support-frames', str(
+                pinned(context, 'min_support_frames', 2)
+            ),
+            '--min-visibility', str(pinned(context, 'min_visibility', 0.2)),
         ]
+        requested_entities = [
+            str(item).strip().lower()
+            for item in (args.get('entities') or [])
+            if str(item).strip()
+        ]
+        if requested_entities:
+            command += ['--entities', *requested_entities]
         result = run_subprocess(command, cwd=context['repo_root'])
         status_path = context['scene_root'] / 'evidence' / 'evidence_status.json'
         response = {
@@ -618,7 +808,7 @@ def register_tools(registry: ToolRegistry):
             '--data-root', str(context['data_root']),
             '--results-root', str(context['results_root']),
             '--device', context.get('device', 'cuda'),
-            '--resolution-level', str(max(1, min(int(args.get('resolution_level', 7)), 9))),
+            '--resolution-level', str(max(1, min(int(pinned(context, 'resolution_level', 7)), 9))),
         ]
         result = run_subprocess(command, cwd=context['repo_root'])
         evidence_dir = context['scene_root'] / 'evidence'
@@ -643,14 +833,19 @@ def register_tools(registry: ToolRegistry):
             '--scene-name', context['scene_name'],
             '--question-id', str(context['question_id']),
             '--entity', entity,
-            '--track-id', str(args.get('track_id', '') or ''),
-            '--method', str(args.get('method', 'percentile')),
-            '--lower-percentile', str(args.get('lower_percentile', 5.0)),
-            '--upper-percentile', str(args.get('upper_percentile', 95.0)),
+            # The measurement method changes the reported number directly, so
+            # it is an experiment setting rather than a per-call choice.
+            '--method', str(pinned(context, 'extent_method', 'percentile')),
+            '--lower-percentile', str(
+                pinned(context, 'extent_lower_percentile', 5.0)
+            ),
+            '--upper-percentile', str(
+                pinned(context, 'extent_upper_percentile', 95.0)
+            ),
             '--data-root', str(context['data_root']),
             '--results-root', str(context['results_root']),
             '--device', context.get('device', 'cuda'),
-            '--resolution-level', str(max(1, min(int(args.get('resolution_level', 7)), 9))),
+            '--resolution-level', str(max(1, min(int(pinned(context, 'resolution_level', 7)), 9))),
         ]
         result = run_subprocess(command, cwd=context['repo_root'])
         evidence_dir = context['scene_root'] / 'evidence'
@@ -666,7 +861,7 @@ def register_tools(registry: ToolRegistry):
         entity = str(args.get('entity', '')).strip().lower()
         if not entity:
             return {'error': 'entity must not be empty'}
-        max_frames = max(2, int(args.get('max_frames', 12)))
+        max_frames = max(2, int(pinned(context, 'count_frames', 12)))
         store = context['store']
 
         objects = [
@@ -684,44 +879,14 @@ def register_tools(registry: ToolRegistry):
             track for track in store.query_tracks(category=entity)
             if track.get('explicit_track')
         ]
-        reliable_tracks = [
-            track for track in explicit_tracks
-            if (
-                len(track.get('frame_ids', [])) >= 2
-                or (
-                    int(track.get('total_points', 0)) >= 5000
-                    and float(track.get('mean_confidence') or 0.0) >= 0.70
-                )
-            )
-        ]
-        if reliable_tracks:
-            explicit_tracks = reliable_tracks
-        if explicit_tracks and args.get('verify_tracks', True):
-            verified_tracks = []
-            for track in explicit_tracks:
-                support = len(track.get('frame_ids', []))
-                mean_confidence = float(track.get('mean_confidence') or 0.0)
-                suspicious = support < 2 or mean_confidence < 0.70
-                if not suspicious:
-                    verified_tracks.append(track)
-                    continue
-                checks = [
-                    verify_candidate(
-                        context,
-                        frame_id=frame_id,
-                        entity=entity,
-                    )
-                    for frame_id in track.get('frame_ids', [])[:2]
-                ]
-                rejected = any(
-                    check.get('valid') is False
-                    for check in checks
-                    if check.get('error') is None
-                )
-                if not rejected:
-                    verified_tracks.append(track)
-            if verified_tracks:
-                explicit_tracks = verified_tracks
+        # Same policy as the constraint path: a single-frame track is accepted
+        # when the detector was confident, regardless of how many points it
+        # happened to produce.
+        reliable = [track for track in explicit_tracks if is_reliable_track(track)]
+        if reliable:
+            explicit_tracks = reliable
+        # Tracks are accepted on 3D evidence alone: the agent is planner-only
+        # and does not call a vision-language model to re-check candidates.
         if explicit_tracks:
             print(
                 f'[Counting] Using object_track_memory for {entity} '
@@ -889,110 +1054,38 @@ def register_tools(registry: ToolRegistry):
                 for item in extracted
             ]
 
-        visible_frames = []
-        for frame in memory_frames:
-            metadata = frame.metadata or {}
-            visibility = metadata.get('visibility', {})
-            detections = metadata.get('detections', {})
-            if float(visibility.get(entity, 0.0)) > 0.0 or entity in detections:
-                visible_frames.append(frame)
-        if visible_frames:
-            memory_frames = visible_frames
-
-        if os.environ.get('GCA_ALLOW_QWEN_COUNTING', '0') != '1':
-            return {
-                'error': (
-                    'Counting requires 3D object tracks/observations. '
-                    'Qwen VLM counting fallback is disabled; set '
-                    'GCA_ALLOW_QWEN_COUNTING=1 to enable it explicitly.'
-                ),
-                'entity': entity,
-                'method': 'missing_3d_tracks',
-            }
-
-        print(
-            f'[Counting] Falling back to VLM multi-frame counting for {entity} '
-            f'with {len(memory_frames)} candidate frames.',
-            flush=True,
-        )
-
-        memory_frames.sort(key=lambda frame: frame.timestamp)
-        count = min(max_frames, len(memory_frames))
-        indices = [
-            int(round(value))
-            for value in (
-                index * (len(memory_frames) - 1) / max(1, count - 1)
-                for index in range(count)
-            )
-        ]
-        selected_frames = [
-            memory_frames[index] for index in sorted(set(indices))
-        ]
-
-        prompt = (
-            f'Count the number of unique physical instances of the category '
-            f'"{entity}" in this room/video. The images are chronological samples. '
-            'Count unique objects, not repeated appearances of the same object in '
-            'multiple frames. Do not count images, rugs, tables, or other categories. '
-            'Return exactly one JSON object with this schema: '
-            '{"count": integer, "instances": [{"description": "...", '
-            '"evidence_frame_indices": [0, 1]}], "confidence": 0.0-1.0, '
-            '"reasoning": "..."}'
-        )
-        content = [{'type': 'text', 'text': prompt}]
-        for frame_index, frame in enumerate(selected_frames):
-            content.append({
-                'type': 'text',
-                'text': (
-                    f'Frame {frame_index}: frame_id={frame.frame_id}, '
-                    f'timestamp={frame.timestamp:.2f}s'
-                ),
-            })
-            image = Image.open(frame.frame_path).convert('RGB')
-            content.append({
-                'type': 'image_url',
-                'image_url': {'url': image_to_data_uri(image)},
-            })
-
-        reserve_api_call('count_entities_in_video', {'entity': entity})
-        response = context.get('vlm_client', context['tool_vlm_client']).chat.completions.create(
-            model=context.get('vlm_model', context['model']),
-            messages=[{'role': 'user', 'content': content}],
-            max_tokens=2048,
-            temperature=0.0,
-            top_p=0.95,
-        )
-        raw_content = response.choices[0].message.content
-        try:
-            result, _ = parse_json_str(raw_content)
-        except Exception as exc:
-            return {
-                'error': f'Failed to parse counting response: {exc}',
-                'raw_response': raw_content,
-            }
-
-        result = {
-            **result,
+        # Not enough 3D evidence yet.  Report that explicitly: this function
+        # used to fall off the end and return None after the VLM counting path
+        # was removed, which the Planner read as "the tool failed" and then
+        # chased metric scale for a counting question.
+        return {
+            'status': 'insufficient_evidence',
             'entity': entity,
-            'method': 'vlm_multi_frame',
-            'frame_ids': [frame.frame_id for frame in selected_frames],
-            'timestamps': [frame.timestamp for frame in selected_frames],
-            'raw_response': raw_content,
+            'count': None,
+            'observations_with_3d': len(observations),
+            'explicit_tracks': len(explicit_tracks),
+            'reasoning': (
+                'No explicit 3D object tracks for this entity yet. Counting '
+                'needs 3D tracks, not a metric scale.'
+            ),
+            'next_step': (
+                'Run scan_entity_visibility, then find_bridge_frames, then '
+                'collect_question_evidence to build 3D tracks, then call '
+                'execute_operation with count_instances.'
+            ),
         }
-        evidence_dir = context['scene_root'] / 'evidence'
-        evidence_dir.mkdir(parents=True, exist_ok=True)
-        (evidence_dir / 'count_result.json').write_text(
-            json.dumps(result, ensure_ascii=False, indent=2) + '\n',
-            encoding='utf-8',
-        )
-        return result
 
     def query_tracks(context: Dict[str, Any], **args):
         category = args.get('category')
         if category is not None:
             category = str(category).strip().lower()
         tracks = context['store'].query_tracks(category=category)
+        geometry_ids = set(available_geometry_ids(context['store'].root_dir))
         return {
+            # Instances that can actually be bound for execute_operation.
+            # query_tracks also returns observation sub-tracks that have no
+            # point cloud of their own.
+            'geometry_instances': sorted(geometry_ids),
             'tracks': [
                 {
                     'track_id': track['track_id'],
@@ -1002,6 +1095,7 @@ def register_tools(registry: ToolRegistry):
                     'mean_confidence': track.get('mean_confidence'),
                     'centroid': track.get('centroid'),
                     'frame_ids': track.get('frame_ids', []),
+                    'has_geometry': str(track.get('track_id')) in geometry_ids,
                 }
                 for track in tracks
             ]
@@ -1017,8 +1111,6 @@ def register_tools(registry: ToolRegistry):
             'type': 'object',
             'properties': {
                 'entities': {'type': 'array', 'items': {'type': 'string'}},
-                'scan_stride_seconds': {'type': 'number', 'default': 4.0},
-                'max_scan_frames': {'type': 'integer', 'default': 80},
             },
             'required': ['entities'],
         },
@@ -1028,21 +1120,19 @@ def register_tools(registry: ToolRegistry):
         name='find_bridge_frames',
         description=(
             'Extract bridge frames across a time interval and include the '
-            'representative anchor frames returned by scan_entity_visibility.'
+            'representative anchor frames returned by scan_entity_visibility. '
+            'Pass the full suggested_bridge_window so each object keeps its '
+            'camera baseline; the stride is widened automatically if the '
+            'window would exceed max_frames.'
         ),
         parameters={
             'type': 'object',
             'properties': {
-                'start_time': {'type': 'number'},
-                'end_time': {'type': 'number'},
-                'interval_seconds': {'type': 'number', 'default': 3.0},
-                'padding_seconds': {'type': 'number', 'default': 1.0},
                 'anchor_frame_ids': {
                     'type': 'array',
                     'items': {'type': 'string'},
                 },
             },
-            'required': ['start_time', 'end_time'],
         },
         handler=find_bridge_frames,
     ))
@@ -1081,27 +1171,6 @@ def register_tools(registry: ToolRegistry):
         handler=select_detection,
     ))
     registry.register(ToolSpec(
-        name='verify_candidate',
-        description=(
-            'Use Qwen only as a checker on one selected candidate. It checks '
-            'whether the boxed crop is the requested object. Use this only for '
-            'suspicious tracks or representative frames, not every frame.'
-        ),
-        parameters={
-            'type': 'object',
-            'properties': {
-                'frame_id': {'type': 'string'},
-                'entity': {'type': 'string'},
-                'bbox': {
-                    'type': 'array',
-                    'items': {'type': 'number'},
-                },
-            },
-            'required': ['frame_id', 'entity'],
-        },
-        handler=verify_candidate,
-    ))
-    registry.register(ToolSpec(
         name='check_evidence',
         description='Read the current EvidenceSufficiencyChecker status.',
         parameters={'type': 'object', 'properties': {}},
@@ -1115,8 +1184,6 @@ def register_tools(registry: ToolRegistry):
             'properties': {
                 'entity': {'type': 'string'},
                 'anchor_frame_ids': {'type': 'array', 'items': {'type': 'string'}},
-                'offsets_seconds': {'type': 'array', 'items': {'type': 'number'}},
-                'max_frames_per_anchor': {'type': 'integer', 'default': 4},
             },
             'required': ['entity', 'anchor_frame_ids'],
         },
@@ -1125,23 +1192,22 @@ def register_tools(registry: ToolRegistry):
     registry.register(ToolSpec(
         name='collect_question_evidence',
         description=(
-            'Run target-conditioned GroundingDINO detection, SAM2 mask generation, '
-            'VGGT reconstruction and evidence selection. Qwen is used only for '
-            'ambiguous semantic checks. The selector reserves support frames per entity.'
+            'Collect 3D evidence (SAM3 boxes+masks, VGGT reconstruction, frame '
+            'selection) for the question. Sampling parameters are fixed by the '
+            'task constraint, not by the Planner, so repeat runs of the same '
+            'question collect the same frames. Pass entities only to restrict '
+            'the pass; by default every entity in the plan is covered.'
         ),
         parameters={
             'type': 'object',
             'properties': {
-                'top_k': {'type': 'integer', 'default': 6},
-                'min_support_frames': {'type': 'integer', 'default': 2},
-                'min_visibility': {'type': 'number', 'default': 0.2},
-                'min_temporal_gap': {'type': 'number', 'default': 5.0},
-                'min_joint_visibility': {'type': 'number', 'default': 0.25},
-                'vlm_workers': {'type': 'integer', 'default': 2},
-                'detector': {
-                    'type': 'string',
-                    'enum': ['grounding_dino', 'vlm'],
-                    'default': 'grounding_dino',
+                'entities': {
+                    'type': 'array',
+                    'items': {'type': 'string'},
+                    'description': (
+                        'Optional: restrict this pass to a subset of the '
+                        "question's entities."
+                    ),
                 },
             },
         },
@@ -1150,12 +1216,7 @@ def register_tools(registry: ToolRegistry):
     registry.register(ToolSpec(
         name='estimate_metric_scale_and_distance',
         description='Estimate metric scale from VGGT/MoGe and compute closest-point distance for target objects.',
-        parameters={
-            'type': 'object',
-            'properties': {
-                'resolution_level': {'type': 'integer', 'default': 7},
-            },
-        },
+        parameters={'type': 'object', 'properties': {}},
         handler=estimate_metric_scale_and_distance,
     ))
     registry.register(ToolSpec(
@@ -1168,15 +1229,6 @@ def register_tools(registry: ToolRegistry):
             'type': 'object',
             'properties': {
                 'entity': {'type': 'string'},
-                'track_id': {'type': 'string'},
-                'method': {
-                    'type': 'string',
-                    'enum': ['raw', 'percentile', 'obb'],
-                    'default': 'percentile',
-                },
-                'lower_percentile': {'type': 'number', 'default': 5.0},
-                'upper_percentile': {'type': 'number', 'default': 95.0},
-                'resolution_level': {'type': 'integer', 'default': 7},
             },
             'required': ['entity'],
         },
@@ -1186,15 +1238,12 @@ def register_tools(registry: ToolRegistry):
         name='count_entities_in_video',
         description=(
             'Count unique physical instances of one category from 3D object '
-            'tracks. Suspicious tracks may be checked once per representative '
-            'frame by Qwen; routine VLM counting is disabled.'
+            'tracks. Purely geometric: no vision-language model is called.'
         ),
         parameters={
             'type': 'object',
             'properties': {
                 'entity': {'type': 'string'},
-                'max_frames': {'type': 'integer', 'default': 12},
-                'verify_tracks': {'type': 'boolean', 'default': True},
             },
             'required': ['entity'],
         },
@@ -1204,8 +1253,9 @@ def register_tools(registry: ToolRegistry):
         name='query_tracks',
         description=(
             'List object tracks in Scene Memory with support, points, '
-            'confidence and centroid. Use this to choose a track before size '
-            'or geometry estimation.'
+            'confidence and centroid, plus the instances that have a point '
+            'cloud. Bind constraint roles only to an entry of '
+            'geometry_instances.'
         ),
         parameters={
             'type': 'object',
@@ -1249,6 +1299,8 @@ def register_tools(registry: ToolRegistry):
             points=points,
             metric_scale=metric_scale,
             coordinate_frame_id=frame_id,
+            available_object_ids=available_geometry_ids(store_root),
+            available_categories=geometry_categories(store_root),
         )
         report = validate_op(constraint, ctx)
         return {
@@ -1278,19 +1330,53 @@ def register_tools(registry: ToolRegistry):
             return {'error': 'bindings must be a non-empty object'}
         stored = load_bindings(context['scene_root'], context['question_id'])
         merged = merge_bindings(constraint, stored, incoming)
-        path = save_bindings(context['scene_root'], context['question_id'], merged)
+
+        # Normalise instance ids to ones that actually have a point cloud.
+        #
+        # query_tracks returns observation sub-tracks (tv_01, sofa_02 ...) that
+        # have no geometry of their own; only <category>_00 is written for the
+        # question.  The Planner is told to bind from geometry_instances but
+        # does not reliably do so, and validation catching it was not enough -
+        # it responded by re-scanning the entity for a dozen steps instead of
+        # rebinding.  Correcting it here removes the whole failure class.
+        geometry_ids = set(available_geometry_ids(context['store'].root_dir))
         known_ids = {obj.object_id for obj in context['store'].query_objects()}
+        corrected = {}
+        for role, value in list(merged.items()):
+            if not isinstance(value, str) or not value or value in geometry_ids:
+                continue
+            if role in ('category', 'categories'):
+                continue
+            siblings = sorted(
+                candidate for candidate in geometry_ids
+                if candidate.rsplit('_', 1)[0] == value.rsplit('_', 1)[0]
+            )
+            if siblings:
+                merged[role] = siblings[0]
+                corrected[role] = {'from': value, 'to': siblings[0]}
+
+        path = save_bindings(context['scene_root'], context['question_id'], merged)
         unknown = {
             role: value
             for role, value in merged.items()
             if isinstance(value, str) and value and value not in known_ids
         }
-        return {
+        result = {
             'bindings': merged,
             'bindings_path': str(path),
             'known_object_ids': sorted(known_ids),
+            'geometry_instances': sorted(geometry_ids),
             'unknown_instances': unknown,
         }
+        if corrected:
+            print(f'[Bind] corrected geometry-less instances: {corrected}', flush=True)
+            result['corrected'] = corrected
+            result['note'] = (
+                'Some ids had no point cloud of their own (they are observation '
+                'sub-tracks). They were rebound to the geometry-bearing '
+                'instance of the same category.'
+            )
+        return result
 
     def validate_operation_tool(context: Dict[str, Any], **args):
         constraint, bindings, error = _constraint_and_bindings(context, args)
@@ -1315,11 +1401,14 @@ def register_tools(registry: ToolRegistry):
             points=points,
             metric_scale=metric_scale,
             coordinate_frame_id=frame_id,
+            available_object_ids=available_geometry_ids(store_root),
+            available_categories=geometry_categories(store_root),
         )
         report = validate_op(constraint, ctx)
         return {
             'operation': operation,
             'bindings': bindings,
+            'available_instances': available_geometry_ids(store_root),
             'resolved_roles': sorted(points.keys()),
             'validation': report,
         }
@@ -1344,8 +1433,13 @@ def register_tools(registry: ToolRegistry):
             points=points,
             metric_scale=metric_scale,
             coordinate_frame_id=frame_id,
+            available_object_ids=available_geometry_ids(store_root),
+            available_categories=geometry_categories(store_root),
         )
         extra = resolve_extra_inputs(operation, bindings, args, store=store)
+        # The aggregation method decides the reported number, so it comes from
+        # the profile rather than from the Planner.
+        extra['method'] = str(pinned(context, 'extent_method', 'percentile'))
         inputs = {
             'points': points,
             'bindings': bindings,
@@ -1460,11 +1554,6 @@ def register_tools(registry: ToolRegistry):
             'properties': {
                 'operation': {'type': 'string'},
                 'bindings': {'type': 'object'},
-                'method': {
-                    'type': 'string',
-                    'enum': ['raw', 'percentile', 'obb'],
-                    'default': 'percentile',
-                },
                 'vertical_axis': {
                     'type': 'array',
                     'items': {'type': 'number'},
@@ -1606,13 +1695,48 @@ def load_question(data_root: Path, dataset: str, scene_name: str, question_id: i
     )
 
 
+def meta_entity_names(plan: Dict[str, Any]) -> set:
+    """Names that appear in a plan but are not detectable objects.
+
+    Two sources of noise:
+
+    * genuinely abstract places - room, scene, area - which the Planner
+      sometimes lists as reference entities even though no single instance can
+      be bound;
+    * reference-FRAME vocabulary.  A local model put the value of
+      ``reference_frame: 'world'`` straight into ``reference_entities``, so the
+      evidence stage spent a SAM3/DINO pass per frame trying to detect an
+      object called "world".
+    """
+    names = {
+        'room', 'scene', 'place', 'environment', 'area',
+        'world', 'camera', 'viewer', 'self', 'frame', 'image', 'video',
+    }
+    reference_frame = str(plan.get('reference_frame') or '').strip().lower()
+    if reference_frame and not reference_frame.startswith('object:'):
+        # 'world', 'camera:003360' and friends name a frame, not a thing.
+        # An 'object:<name>' anchor is the opposite case: <name> is a real
+        # object (often the very one the question faces towards), so it must
+        # stay bindable.
+        names.add(reference_frame)
+    return {name for name in names if name}
+
+
 def sanitize_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
-    meta_entities = {'room', 'scene', 'place', 'environment', 'area'}
+    meta_entities = meta_entity_names(plan)
     sanitized = dict(plan)
     sanitized['reference_entities'] = [
         entity for entity in sanitized.get('reference_entities', [])
         if str(entity).strip().lower() not in meta_entities
     ]
+    # The same noise can arrive in target_entities; drop it there too, but only
+    # if something real remains.
+    targets = [
+        entity for entity in sanitized.get('target_entities', [])
+        if str(entity).strip().lower() not in meta_entities
+    ]
+    if targets:
+        sanitized['target_entities'] = targets
     reference_frame = str(sanitized.get('reference_frame', '')).strip().lower()
     if reference_frame.startswith('object:'):
         entity = reference_frame.split(':', 1)[1].strip().lower()
@@ -1730,35 +1854,53 @@ async def main():
     )
 
     planner_endpoint = resolve_endpoint('planner')
-    vlm_endpoint = resolve_endpoint('vlm')
     planner_client = create_async_client(planner_endpoint)
-    vlm_client = create_sync_client(vlm_endpoint)
-    model = planner_endpoint.model
-    base_url = vlm_endpoint.base_url
-    api_key = vlm_endpoint.api_key
-    sync_client = vlm_client
     client = planner_client
     planner_model = planner_endpoint.model
-    vlm_model = vlm_endpoint.model
     print(f'[Agent] Planner endpoint: {json.dumps(planner_endpoint.describe())}', flush=True)
-    print(f'[Agent] VLM endpoint    : {json.dumps(vlm_endpoint.describe())}', flush=True)
-    if planner_endpoint.model == vlm_endpoint.model and (
-        planner_endpoint.base_url == vlm_endpoint.base_url
-    ):
-        print(
-            '[Agent] Planner and VLM share one model; set AGENT_PLANNER_* to '
-            'use a cheaper text-only model for planning.',
-            flush=True,
-        )
+    print(
+        '[Agent] Planner-only mode: all perception runs through SAM3 / SAM2 / '
+        'VGGT / GroundingDINO; no vision-language model is called.',
+        flush=True,
+    )
 
     print(f'[Agent] Question: {question["question"]}', flush=True)
     print(f'[Agent] Scene root: {scene_root}', flush=True)
+
+    # A results root must belong to exactly one question.  Sharing it makes
+    # questions share evidence/ and agent_memory.json, so one question's
+    # observations leak into the next and the accumulated memory can push the
+    # Planner prompt past the model's context limit.
+    previous_qids = set()
+    previous = read_json(scene_root / 'evidence' / 'agent_result.json', {}) or {}
+    recorded = ((previous.get('task_constraint') or {}).get('question_id'))
+    if recorded is not None:
+        previous_qids.add(int(recorded))
+    # Also look at the directory layout: a stale or missing agent_result.json
+    # must not hide the fact that another question has run here.
+    for path in (scene_root / 'questions').glob('*'):
+        if path.is_dir() and path.name.isdigit():
+            previous_qids.add(int(path.name))
+    for path in (scene_root / 'question_plans').glob('*.json'):
+        if path.stem.isdigit():
+            previous_qids.add(int(path.stem))
+    foreign = sorted(q for q in previous_qids if q != int(args.question_id))
+    if foreign:
+        print(
+            '[Agent] WARNING: this scene root already holds results for '
+            f'question(s) {foreign}, but you are running '
+            f'{args.question_id}. Evidence and agent memory are stored per '
+            'scene root, so the two questions would share and corrupt each '
+            "other's state. Use one results root per question, e.g. "
+            f'--results-root <root>/{question["question_type"]}/{args.question_id}',
+            flush=True,
+        )
     plan_path = scene_root / 'question_plans' / f'{args.question_id}.json'
     if plan_path.exists() and not args.force_plan:
         plan = json.loads(plan_path.read_text(encoding='utf-8'))
         print(f'[Agent] Loaded existing Evidence Plan: {plan_path}', flush=True)
     else:
-        evidence_planner = QuestionEvidencePlanner(client=client, model=model)
+        evidence_planner = QuestionEvidencePlanner(client=client, model=planner_model)
         try:
             evidence_request = await evidence_planner.plan(
                 question=question['question'],
@@ -1787,7 +1929,10 @@ async def main():
             'question_type': question['question_type'],
             'question': question['question'],
             'options': question['options'],
-            'ground_truth': question['ground_truth'],
+            # NOTE: ground_truth is deliberately NOT persisted here.  It is
+            # only needed by the offline evaluator, which reads the dataset,
+            # and keeping it out of this file means no later code path can
+            # leak it into a prompt.
         })
         plan_path.parent.mkdir(parents=True, exist_ok=True)
         plan_path.write_text(
@@ -1799,6 +1944,50 @@ async def main():
         key: value for key, value in plan.items() if key != 'ground_truth'
     })
     task_constraint = compile_task_constraint(planner_plan)
+
+    # The constraint is compiled from the question text, so it knows which
+    # entities the question actually mentions.  If the evidence plan missed one,
+    # the evidence stage will never look for it and the corresponding role can
+    # never be bound.  Observed: "standing by the stove and facing the sofa, is
+    # the tv to the left or right?" compiled with origin=stove, but the plan
+    # listed only sofa and tv - so no stove geometry was ever collected and the
+    # run looped for 15 steps trying to bind an entity that could not exist.
+    _META = {'room', 'scene', 'place', 'environment', 'area'}
+    constraint_categories = {
+        str(entity.category).strip().lower()
+        for entity in task_constraint.entities
+        if str(entity.category).strip()
+    }
+    plan_categories = {
+        str(item).strip().lower()
+        for key in ('target_entities', 'reference_entities')
+        for item in (planner_plan.get(key) or [])
+        if str(item).strip()
+    }
+    missing_entities = sorted(
+        constraint_categories - plan_categories - _META
+    )
+    if missing_entities:
+        print(
+            '[Constraint] The question needs entities the evidence plan never '
+            f'listed: {missing_entities}. Adding them as reference entities so '
+            'the evidence stage collects their geometry.',
+            flush=True,
+        )
+        planner_plan.setdefault('target_entities', [])
+        planner_plan.setdefault('reference_entities', [])
+        planner_plan['reference_entities'] = list(
+            dict.fromkeys(planner_plan['reference_entities'] + missing_entities)
+        )
+        task_constraint = compile_task_constraint(planner_plan)
+        if plan_path.exists():
+            plan_file = json.loads(plan_path.read_text(encoding='utf-8'))
+            plan_file['reference_entities'] = planner_plan['reference_entities']
+            plan_path.write_text(
+                json.dumps(plan_file, ensure_ascii=False, indent=2) + '\n',
+                encoding='utf-8',
+            )
+
     constraint_file = save_constraint(task_constraint, scene_root, args.question_id)
     task_constraint_dict = task_constraint.to_dict()
     print(
@@ -1847,6 +2036,19 @@ async def main():
         print(f'[Agent] Reset Agent Memory. Backup: {backup_path}', flush=True)
     agent_memory = AgentMemory.load(agent_memory_path) if agent_memory_path.exists() else AgentMemory()
 
+    evidence_profile = evidence_profile_for(
+        task_constraint_dict['operation']['operation']
+    )
+    print(
+        f'[Profile] evidence parameters pinned for '
+        f'{evidence_profile.operation or "<no operation>"}: '
+        f'detector={evidence_profile.detector} '
+        f'top_k={evidence_profile.top_k_frames} '
+        f'min_support={evidence_profile.min_support_frames} '
+        f'bridge<= {evidence_profile.max_bridge_frames} frames',
+        flush=True,
+    )
+
     registry = register_tools(ToolRegistry())
     if args.allow_tool_generation:
         for generated_spec in load_generated_tool_specs(
@@ -1877,24 +2079,18 @@ async def main():
         'question_type': question['question_type'],
         'scene_root': scene_root,
         'task_constraint': task_constraint_dict,
+        'evidence_profile': evidence_profile.to_dict(),
         'store': store,
         'device': args.device,
-        'tool_vlm_client': vlm_client,
-        'vlm_client': vlm_client,
-        'vlm_model': vlm_model,
         'planner_model': planner_model,
-        'model': vlm_model,
-        'base_url': vlm_endpoint.base_url,
-        'api_key': vlm_endpoint.api_key,
         'llm_endpoints': {
             'planner': planner_endpoint.describe(),
-            'vlm': vlm_endpoint.describe(),
         },
     }
     tool_synthesizer = (
         ToolSynthesizer(
             client=client,
-            model=model,
+            model=planner_model,
             generated_dir=repo_root / 'tools' / 'generated',
         )
         if args.allow_tool_generation
@@ -1902,7 +2098,7 @@ async def main():
     )
     loop = PlannerLoop(
         client=client,
-        model=model,
+        model=planner_model,
         registry=registry,
         context=context,
         agent_memory=agent_memory,
@@ -1919,7 +2115,6 @@ async def main():
     agent_memory.save(agent_memory_path)
     result['llm_endpoints'] = {
         'planner': planner_endpoint.describe(),
-        'vlm': vlm_endpoint.describe(),
     }
     result['task_constraint'] = task_constraint_dict
     result['constraint_dir'] = str(

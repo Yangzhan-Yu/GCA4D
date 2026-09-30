@@ -1,7 +1,6 @@
 import base64
 import io
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -10,10 +9,8 @@ from typing import Any, Dict, List, Optional
 import cv2
 from PIL import Image
 
-from openai import OpenAI
 
 from tools.apis.four_d_memory import open_vsibench_memory
-from tools.apis.api_budget import reserve_api_call
 from tools.apis.temporal_neighbor_search import extract_video_frames_at_timestamps
 from workflow.utils.parse_utils import parse_json_str
 
@@ -150,44 +147,18 @@ def vlm_chat(
     content: List[Dict[str, Any]],
     max_tokens: int = 2048,
 ) -> str:
-    reserve_api_call('generated_tool_vlm_chat')
-    base_url = context.get('base_url')
-    api_key = context.get('api_key')
-    model = context.get('model')
-    if not (base_url and api_key and model):
-        from tools.apis.llm_endpoint import (
-            chat_text,
-            create_sync_client,
-            resolve_endpoint,
-        )
+    """Disabled: the agent is planner-only and calls no vision-language model.
 
-        endpoint = resolve_endpoint('vlm')
-        base_url = base_url or endpoint.base_url
-        api_key = api_key or endpoint.api_key
-        model = model or endpoint.model
-        client = context.get('vlm_client') or create_sync_client(endpoint)
-        return chat_text(
-            client,
-            model=model,
-            messages=[{'role': 'user', 'content': content}],
-            max_tokens=max_tokens,
-            temperature=0.0,
-            top_p=0.95,
-        )
-    client = context.get('vlm_client') or OpenAI(
-        base_url=base_url,
-        api_key=api_key,
-        timeout=120.0,
-        max_retries=2,
+    Generated tools must implement perception with the provided primitives
+    (SAM3, SAM2, VGGT, GroundingDINO) rather than asking an LLM to look at
+    images.  Kept as a named failure so old generated tools report why they
+    cannot run instead of raising an opaque AttributeError.
+    """
+    raise RuntimeError(
+        'vlm_chat is unavailable: the agent is planner-only and does not call '
+        'a vision-language model. Use the SAM3/SAM2/VGGT/GroundingDINO '
+        'primitives for perception instead.'
     )
-    response = client.chat.completions.create(
-        model=model,
-        messages=[{'role': 'user', 'content': content}],
-        max_tokens=max_tokens,
-        temperature=0.0,
-        top_p=0.95,
-    )
-    return response.choices[0].message.content
 
 
 def parse_json_object(content: str) -> Dict[str, Any]:

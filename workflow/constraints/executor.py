@@ -16,11 +16,12 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import re
 from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 
-from workflow.constraints.operations import OPERATION_SPECS
+from workflow.constraints.operations import OPERATION_SPECS, strip_option_marker
 
 
 DEFAULT_DIRECTION_BOUNDARIES = {
@@ -243,15 +244,77 @@ def relative_direction(
     }
 
 
-def _direction_label(angle_deg: float, bounds: Dict[str, float]) -> str:
-    front = float(bounds.get('front_deg', 45.0))
-    back = float(bounds.get('back_deg', 135.0))
-    magnitude = abs(angle_deg)
-    if magnitude <= front:
-        return 'front'
-    if magnitude >= back:
-        return 'back'
-    return 'right' if angle_deg > 0 else 'left'
+DIRECTION_LABELS = ('front', 'back', 'left', 'right')
+
+# Angular centre of each canonical direction label, in the GCA object-frame
+# convention where a *positive* signed angle means "to the right".
+_CANONICAL_DIRECTIONS = (
+    (('front',), 0.0),
+    (('front', 'right'), 45.0),
+    (('right',), 90.0),
+    (('back', 'right'), 135.0),
+    (('back',), 180.0),
+    (('back', 'left'), -135.0),
+    (('left',), -90.0),
+    (('front', 'left'), -45.0),
+)
+
+
+def _label_words(label: str):
+    return set(re.split(r'[\s\-_]+', str(label).lower())) & set(DIRECTION_LABELS)
+
+
+def _option_centre(label: str):
+    """Angular centre of an answer option, or None if it names no direction."""
+    words = _label_words(label)
+    if not words:
+        return None
+    for canonical, angle in _CANONICAL_DIRECTIONS:
+        if set(canonical) == words:
+            return angle
+    return None
+
+
+def allowed_direction_labels(options) -> set:
+    """The direction labels the answer options actually offer.
+
+    Returns the option payloads (marker stripped), so a compound option such as
+    ``"A. front-left"`` yields ``"front-left"``.
+    """
+    labels = set()
+    for option in options or []:
+        payload = strip_option_marker(option).lower().strip()
+        if payload and _label_words(payload):
+            labels.add(payload)
+    return labels
+
+
+def _direction_label(angle_deg: float, bounds: Dict[str, Any]) -> str:
+    """Name the sector the target falls in, using the options as the sectors.
+
+    Rather than hardcoding 45/135 degree cut-offs, each option is placed at its
+    angular centre and the target is assigned to the nearest one.  That
+    reproduces VSI-Bench's own boundaries - a back/right/left question splits
+    back from right at 135 degrees, which is exactly what its wording says -
+    and it also handles compound options such as "front-left".
+    """
+    labels = list(bounds.get('allowed') or [])
+    centres = [
+        (label, _option_centre(label)) for label in labels
+    ]
+    centres = [(label, angle) for label, angle in centres if angle is not None]
+    if not centres:
+        # No options supplied: report the full four-way labelling rather than
+        # collapsing everything to left/right.
+        centres = [
+            ('front', 0.0), ('right', 90.0), ('back', 180.0), ('left', -90.0),
+        ]
+
+    def angular_distance(centre: float) -> float:
+        return abs((angle_deg - centre + 180.0) % 360.0 - 180.0)
+
+    return min(centres, key=lambda item: angular_distance(item[1]))[0]
+
 
 
 # --------------------------------------------------------------------------
@@ -324,6 +387,18 @@ def _pointcloud_digest(points) -> str:
     )
     return hashlib.sha1(summary.encode('utf-8')).hexdigest()[:12]
 
+
+
+def _aux(inputs: Dict[str, Any], points_by_role: Dict[str, Any], key: str, default=None):
+    """Read an auxiliary (non point-cloud) input.
+
+    ``points_by_role`` only holds role -> point cloud.  Auxiliary payloads such
+    as ``tracks`` or ``time_intervals`` are supplied at the top level of
+    ``inputs``; falling back to ``points_by_role`` keeps older callers working.
+    """
+    if key in inputs:
+        return inputs[key]
+    return points_by_role.get(key, default)
 
 # --------------------------------------------------------------------------
 # operation dispatch
@@ -447,24 +522,41 @@ def execute_operation(
             ) if item is not None
         ]
         if len(extents) >= 2:
+            spread = float(max(extents) - min(extents))
+            tolerance = float(0.25 * np.median(extents))
             stability = {
-                'spread': float(max(extents) - min(extents)),
-                'tolerance': float(0.25 * np.median(extents)),
+                'spread': spread,
+                'tolerance': tolerance,
             }
+            # The validator blocks on this; record the flag too so the reason
+            # is visible in the result without reading the validation report.
+            if spread > tolerance:
+                quality_flags.append('unstable_extent')
 
     elif operation == 'count_instances':
-        tracks = points_by_role.get('tracks') or []
+        tracks = _aux(inputs, points_by_role, 'tracks') or []
+        all_tracks = _aux(inputs, points_by_role, 'tracks_all') or tracks
         value = int(len(tracks))
         unit = 'count'
-        metrics = {'tracks': tracks}
+        metrics = {
+            'tracks': tracks,
+            'track_count': len(tracks),
+            'track_count_unfiltered': len(all_tracks),
+        }
+        # If a quality filter removed tracks, say so rather than silently
+        # reporting a smaller number.
+        if len(all_tracks) > len(tracks):
+            quality_flags.append('tracks_filtered')
 
     elif operation == 'relative_direction':
+        boundaries = dict(inputs.get('direction_boundaries') or {})
+        boundaries.setdefault('allowed', sorted(allowed_direction_labels(options)))
         outcome = relative_direction(
             points_by_role.get('origin'),
             points_by_role.get('forward'),
             points_by_role.get('target'),
             vertical_axis=inputs.get('vertical_axis', (0.0, 1.0, 0.0)),
-            boundaries=inputs.get('direction_boundaries'),
+            boundaries=boundaries,
         )
         value = outcome.get('label')
         unit = 'option'
@@ -476,7 +568,7 @@ def execute_operation(
         }
 
     elif operation == 'first_visible_order':
-        intervals = points_by_role.get('time_intervals') or {}
+        intervals = _aux(inputs, points_by_role, 'time_intervals') or {}
         ordered = sorted(intervals.items(), key=lambda item: item[1] if item[1] is not None else float('inf'))
         value = [name for name, _ in ordered]
         unit = 'option'
@@ -496,7 +588,7 @@ def execute_operation(
             value = round(float(hull), 4)
 
     elif operation == 'route_turns':
-        turns = points_by_role.get('turns') or []
+        turns = _aux(inputs, points_by_role, 'turns') or []
         value = list(turns)
         unit = 'option'
         metrics = {'turns': value}

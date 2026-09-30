@@ -7,6 +7,11 @@ from workflow.agentic.tool_registry import ToolSpec
 from workflow.agentic.tool_validator import validate_generated_tool
 from workflow.utils.parse_utils import parse_json_str
 from tools.apis.api_budget import reserve_api_call
+from tools.apis.llm_endpoint import (
+    async_chat_text,
+    planner_max_tokens,
+    request_extra,
+)
 
 
 SYNTHESIZER_PROMPT = """
@@ -166,14 +171,15 @@ class ToolSynthesizer:
             .replace('{feedback}', feedback or 'None')
         )
         reserve_api_call('tool_synthesizer', {'capability': capability})
-        response = await self.client.chat.completions.create(
+        content = await async_chat_text(
+            self.client,
             model=self.model,
             messages=[{'role': 'user', 'content': prompt}],
-            max_tokens=4096,
+            max_tokens=planner_max_tokens(4096),
             temperature=0.0,
             top_p=0.95,
+            extra=request_extra(),
         )
-        content = response.choices[0].message.content
         decision, _ = parse_json_str(content)
         code = _extract_code(str(decision.get('code', '')))
         slug = _slugify(capability)

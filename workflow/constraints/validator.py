@@ -17,8 +17,13 @@ Planner can convert it into a targeted repair action instead of a blind retry.
 from typing import Any, Dict, List, Optional
 
 import math
+import re
 
-from workflow.constraints.operations import OPERATION_SPECS
+from workflow.constraints.operations import (
+    CATEGORY_ROLES,
+    OPERATION_SPECS,
+    strip_option_marker,
+)
 
 
 # Roles that must be bound before an operation may execute.
@@ -52,7 +57,7 @@ BLOCKING_QUALITY_FLAGS = {
 SUGGESTED_ACTIONS: Dict[str, List[str]] = {
     'unsupported_operation': [],
     'entity_not_bound': ['query_tracks', 'collect_question_evidence'],
-    'ambiguous_entity_binding': ['detect_objects', 'select_detection', 'verify_candidate'],
+    'ambiguous_entity_binding': ['detect_objects', 'select_detection'],
     'duplicate_instance_binding': [
         'detect_objects',
         'select_detection',
@@ -67,6 +72,7 @@ SUGGESTED_ACTIONS: Dict[str, List[str]] = {
     'empty_pointcloud': ['collect_question_evidence'],
     'unit_mismatch': [],
     'answer_not_mappable': ['validate_result'],
+    'invalid_category_binding': ['query_tracks', 'bind_constraint_entities'],
 }
 
 
@@ -178,19 +184,71 @@ def validate_operation(constraint: Any, context: Optional[Dict[str, Any]] = None
         else:
             resolved[role] = str(value)
 
+    # 2a. Category roles must name a category ---------------------------
+    available_categories = {
+        str(item).strip().lower()
+        for item in context.get('available_categories', [])
+        if str(item).strip()
+    }
+    for role in REQUIRED_ROLES.get(operation, []):
+        if role not in CATEGORY_ROLES:
+            continue
+        value = resolved.get(role)
+        if value is None:
+            continue
+        text = str(value).strip()
+        # A comma-joined list of track ids is the classic mistake here: the
+        # Planner sees query_tracks output and pastes several ids into the
+        # category role.  It silently matched zero tracks before.
+        looks_like_ids = ',' in text or bool(re.search(r'\d', text))
+        if available_categories:
+            if text.lower() not in available_categories or looks_like_ids:
+                errors.append(_error(
+                    'invalid_category_binding',
+                    (
+                        f'Role {role!r} must be a category name, got {text!r}. '
+                        f'Categories present in this scene: '
+                        f'{sorted(available_categories)}.'
+                    ),
+                    operation=operation,
+                    role=role,
+                    value=text,
+                    available_categories=sorted(available_categories),
+                ))
+        elif looks_like_ids:
+            errors.append(_error(
+                'invalid_category_binding',
+                (
+                    f'Role {role!r} looks like an instance id list ({text!r}); '
+                    'it must be a category name such as "chair".'
+                ),
+                operation=operation,
+                role=role,
+                value=text,
+            ))
+
     # 2. Instance availability ---------------------------------------------
     if available_ids:
         for role, instance_id in resolved.items():
+            if role in CATEGORY_ROLES:
+                # Category roles hold a category name, not an object id.
+                continue
             if instance_id not in available_ids:
                 errors.append(_error(
                     'entity_not_bound',
                     (
                         f'Role {role!r} binds to {instance_id!r}, which has no '
-                        'geometry in scene memory.'
+                        f'geometry in scene memory. Available instances: '
+                        f'{sorted(available_ids)}.'
                     ),
                     operation=operation,
                     role=role,
                     instance_id=instance_id,
+                    available_instances=sorted(available_ids),
+                    suggested_actions=[
+                        'query_tracks',
+                        'bind_constraint_entities',
+                    ],
                 ))
 
     # 3. Distinctness -------------------------------------------------------
@@ -295,17 +353,35 @@ def validate_operation(constraint: Any, context: Optional[Dict[str, Any]] = None
                 ))
 
     # 9. Point cloud presence ----------------------------------------------
-    for role, instance_id in resolved.items():
-        if role in ('category', 'categories'):
-            continue
-        points = (context.get('points') or {}).get(role)
-        if points is not None and hasattr(points, '__len__') and len(points) == 0:
+    point_roles = [
+        role for role in REQUIRED_ROLES.get(operation, [])
+        if role not in CATEGORY_ROLES and role in resolved
+    ]
+    supplied_points = context.get('points') or {}
+    for role in point_roles:
+        if role not in supplied_points:
+            # The role resolved to an instance, but no geometry was loaded for
+            # it.  Catching this here turns a confusing "empty point cloud"
+            # rejection *after* execution into a targeted repair request.
             errors.append(_error(
                 'empty_pointcloud',
-                f'Role {role!r} ({instance_id}) has an empty point cloud.',
+                (
+                    f'No point cloud was loaded for role {role!r} '
+                    f'({resolved.get(role)}).'
+                ),
                 operation=operation,
                 role=role,
-                instance_id=instance_id,
+                instance_id=resolved.get(role),
+            ))
+            continue
+        points = supplied_points.get(role)
+        if hasattr(points, '__len__') and len(points) == 0:
+            errors.append(_error(
+                'empty_pointcloud',
+                f'Role {role!r} ({resolved.get(role)}) has an empty point cloud.',
+                operation=operation,
+                role=role,
+                instance_id=resolved.get(role),
             ))
 
     return {
@@ -320,39 +396,65 @@ def validate_operation(constraint: Any, context: Optional[Dict[str, Any]] = None
     }
 
 
+def _option_payload(option: str) -> str:
+    return strip_option_marker(option)
+
+
 def map_value_to_option(value, options, unit: str = '') -> Optional[str]:
-    """Map a numeric value onto the closest answer option, if any.
+    """Map a computed value onto the closest answer option.
 
-    VSI-Bench numeric answers are compared with a relative tolerance, and the
-    option text usually contains a number plus a unit.  We therefore parse the
-    option strings and pick the closest numeric match when one is close enough.
+    Handles the two option shapes VSI-Bench uses:
+
+    * numeric answers compared with a relative tolerance, e.g.
+      ``2.9 -> '2.9 m'``;
+    * lettered multiple-choice options where the model computes a semantic
+      label, e.g. ``'left' -> 'A. left'``.
+
+    Returning the full option string is what the official scorer expects: its
+    ``_extract_mca_answer`` splits on the first space and strips the trailing
+    dot, so ``'A. left'`` scores as ``'a'``.
     """
-    if not options:
-        return None
-    import re
-
-    if isinstance(value, str):
-        for option in options:
-            if option.strip().lower() == value.strip().lower():
-                return option
+    if not options or value is None:
         return None
 
-    numbers: List[tuple] = []
+    text = str(value).strip().lower()
+
+    # 1. exact match (covers passing an option straight through)
     for option in options:
-        match = re.findall(r'-?\d+(?:\.\d+)?', str(option))
-        if match:
-            numbers.append((float(match[0]), option))
-    if not numbers:
+        if str(option).strip().lower() == text:
+            return option
+
+    numeric = None
+    if isinstance(value, bool):
+        numeric = None
+    elif isinstance(value, (int, float)):
+        numeric = float(value)
+    else:
+        try:
+            numeric = float(text)
+        except (TypeError, ValueError):
+            numeric = None
+
+    # 2. numeric value -> nearest numeric option
+    if numeric is not None:
+        numbers = []
         for option in options:
-            if str(option).strip().lower() == str(value).strip().lower():
-                return option
+            match = re.findall(r'-?\d+(?:\.\d+)?', str(option))
+            if match:
+                numbers.append((float(match[0]), option))
+        if numbers:
+            return min(numbers, key=lambda item: abs(item[0] - numeric))[1]
         return None
 
-    if not _is_finite_number(value):
-        return None
-    target = float(value)
-    best = min(numbers, key=lambda item: abs(item[0] - target))
-    return best[1]
+    # 3. semantic label -> option whose text matches, ignoring the marker
+    for option in options:
+        if _option_payload(option).lower() == text:
+            return option
+    for option in options:
+        payload = _option_payload(option).lower()
+        if payload and re.search(rf'\b{re.escape(text)}\b', payload):
+            return option
+    return None
 
 
 def validate_result(
@@ -439,6 +541,9 @@ def validate_result(
     spread = stability.get('spread')
     if _is_finite_number(tol) and _is_finite_number(spread):
         if float(spread) > float(tol):
+            # Blocking on purpose.  raw / percentile / OBB disagreeing means
+            # the point cloud is incomplete along some axis, so the number is
+            # not trustworthy.  Answering anyway would hide that.
             errors.append(_error(
                 'unstable_result',
                 (

@@ -1,12 +1,35 @@
 import json
+from collections import Counter
 from typing import Any, Callable, Dict, Optional
 
-from tools.apis.llm_endpoint import async_chat_text
+from tools.apis.llm_endpoint import (
+    async_chat_text,
+    planner_max_tokens,
+    request_extra,
+)
 from workflow.agentic.tool_executor import ToolExecutor
 from workflow.agentic.tool_registry import ToolRegistry
 from tools.apis.api_budget import ApiBudgetExceeded, reserve_api_call
 from workflow.prompts.agent_tool_planner import build_agent_tool_planner_prompt
 from workflow.utils.parse_utils import parse_first_json_object
+
+
+def operation_name_from_state(state) -> str:
+    """The configured operation, from either shape of ``task_constraint``.
+
+    The loop's ``state_provider`` summarises the constraint as
+    ``{'operation': 'count_instances', ...}`` (a string), while the full
+    compiled constraint is ``{'operation': {'operation': 'count_instances'}}``
+    (a dict).  Code that assumed one shape broke on the other - accepting both
+    here is cheaper than keeping two shapes in sync across modules.
+    """
+    constraint = (state or {}).get('task_constraint') or {}
+    if not isinstance(constraint, dict):
+        return ''
+    operation = constraint.get('operation')
+    if isinstance(operation, dict):
+        operation = operation.get('operation')
+    return str(operation) if operation else ''
 
 
 class PlannerLoop:
@@ -45,6 +68,24 @@ class PlannerLoop:
         )
         self.max_tool_failures = max_tool_failures
         self.tool_failure_counts = {}
+        # Identical (tool, args) repeats are the signature of a loop.  The step
+        # cap eventually stops the run, but by then every step is wasted, so
+        # the third identical call is refused with an explicit instruction.
+        self.call_signatures = Counter()
+        # A local planner occasionally emits prose or an unclosed  thinking
+        # block instead of the decision JSON.  That is an expected failure mode
+        # and must not abort the whole question: without a result file the
+        # official evaluator has no prediction to score at all.
+        self.max_parse_failures = 2
+        self.parse_failures = 0
+        # Distinguishes "we cut it off" from "it was stuck".  A run that ends
+        # while still making progress means the budget was the binding
+        # constraint, which is exactly what must not happen on free local
+        # inference; a run that ends flat is a reasoning problem.
+        self.max_steps_without_progress = max(8, self.max_total_steps // 3 if self.max_total_steps else 8)
+        self._best_progress = -1
+        self._steps_since_progress = 0
+        self._last_progress_note = ''
         self.state_provider = state_provider
         self.tool_synthesizer = tool_synthesizer
         self.done_validator = done_validator
@@ -57,7 +98,7 @@ class PlannerLoop:
     def _memory_summary(self):
         if self.agent_memory is None:
             return {}
-        return self.agent_memory.to_dict()
+        return self.agent_memory.prompt_summary()
 
     def _available_tools(self):
         tools = self.registry.describe()
@@ -73,6 +114,87 @@ class PlannerLoop:
                 if tool['name'] != 'estimate_object_size'
             ]
         return tools
+
+    @staticmethod
+    def _progress_score(state) -> int:
+        """A coarse measure of how close the constraint is to being answerable.
+
+        Weights are ordered by how decisive each event is: a verified result
+        ends the question, an operation result is one validation away, a valid
+        constraint means every role is bound.
+        """
+        validation = state.get('constraint_validation') or {}
+        resolved = len(validation.get('resolved_bindings') or {})
+        return (
+            100 * len(state.get('verified_operation_results') or {})
+            + 20 * len(state.get('operation_results') or {})
+            + 10 * int(bool(validation.get('valid')))
+            + resolved
+        )
+
+    def _track_progress(self, state) -> bool:
+        """Update the progress tracker; return True if this step improved it."""
+        score = self._progress_score(state)
+        if score > self._best_progress:
+            self._best_progress = score
+            self._steps_since_progress = 0
+            return True
+        self._steps_since_progress += 1
+        return False
+
+    def _budget_pressure_note_safe(self, state, total_steps: int) -> str:
+        """Wrap the note so a bug here cannot abort a question.
+
+        This runs on the prompt path: an exception used to propagate out of the
+        loop and kill the process with no result file at all.
+        """
+        try:
+            return self._budget_pressure_note(state, total_steps)
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f'[Planner] budget note skipped ({type(exc).__name__}: {exc})',
+                flush=True,
+            )
+            return ''
+
+    def _budget_pressure_note(self, state, total_steps: int) -> str:
+        """Push a wandering Planner to the executable step before the cap.
+
+        Observed repeatedly: the evidence was already sufficient, but the
+        Planner kept re-checking detections and never called execute_operation,
+        so the run ended with no answer at all.  The nudge is driven by the
+        step budget rather than by tuning the standing prompt text.
+        """
+        if not self.max_total_steps:
+            return ''
+        operation = operation_name_from_state(state)
+        if not operation:
+            return ''
+        used = total_steps / max(1, self.max_total_steps)
+        if used < 0.6:
+            return ''
+        verified = state.get('verified_operation_results') or {}
+        executed = state.get('operation_results') or {}
+        if verified:
+            return (
+                f'\n\n*** BUDGET: {total_steps}/{self.max_total_steps} steps used. '
+                f'A verified result already exists ({sorted(verified)}). '
+                'Finalize NOW with done=true and its operation_result_id. ***'
+            )
+        if executed:
+            return (
+                f'\n\n*** BUDGET: {total_steps}/{self.max_total_steps} steps used. '
+                f'Operation results exist ({sorted(executed)}) but none is '
+                'verified. Repair the reported error_type, or collect the '
+                'missing evidence, then finalize. ***'
+            )
+        return (
+            f'\n\n*** BUDGET: {total_steps}/{self.max_total_steps} steps used and '
+            f'no operation result exists yet. The constraint defines '
+            f'{operation!r}. Call execute_operation now with the evidence you '
+            'already have (bind any missing roles first), then finalize with '
+            'its operation_result_id. Do not keep re-checking detections. ***'
+        )
 
     async def run(self, question: str, plan: Dict[str, Any]) -> Dict[str, Any]:
         total_steps = 0
@@ -91,6 +213,10 @@ class PlannerLoop:
                         ),
                         'rounds': round_index + 1,
                         'steps': total_steps,
+                        # If this is 0 the run was still improving when it was
+                        # cut off - i.e. the budget was the binding constraint.
+                        'steps_since_progress': self._steps_since_progress,
+                        'progress_score': self._best_progress,
                     }
                 if (
                     self.max_steps_per_round is not None
@@ -110,6 +236,21 @@ class PlannerLoop:
                     flush=True,
                 )
                 state = self._state()
+                self._track_progress(state)
+                if self._steps_since_progress >= self.max_steps_without_progress:
+                    return {
+                        'done': False,
+                        'error': (
+                            'No measurable progress for '
+                            f'{self._steps_since_progress} steps (no new bound '
+                            'role, operation result or verified result). The '
+                            'Planner is stuck, not out of budget.'
+                        ),
+                        'rounds': round_index + 1,
+                        'steps': total_steps,
+                        'progress_score': self._best_progress,
+                        'steps_since_progress': self._steps_since_progress,
+                    }
                 print(
                     '[Planner] Scene state: '
                     f"frames={state.get('scene_summary', {}).get('counts', {}).get('frames', '?')}, "
@@ -138,6 +279,7 @@ class PlannerLoop:
                         ),
                     },
                 )
+                prompt += self._budget_pressure_note_safe(state, total_steps)
                 try:
                     reserve_api_call(
                         'planner',
@@ -150,9 +292,10 @@ class PlannerLoop:
                         self.client,
                         model=self.model,
                         messages=[{'role': 'user', 'content': prompt}],
-                        max_tokens=2048,
+                        max_tokens=planner_max_tokens(2048),
                         temperature=0.0,
                         top_p=0.95,
+                        extra=request_extra(),
                     )
                 except ApiBudgetExceeded as exc:
                     return {
@@ -182,10 +325,81 @@ class PlannerLoop:
                     )
                 try:
                     decision = parse_first_json_object(content)
-                except Exception:
-                    print('[Planner] Failed to parse decision. Raw response follows:', flush=True)
-                    print(content, flush=True)
-                    raise
+                    self.parse_failures = 0
+                except Exception as exc:  # noqa: BLE001
+                    self.parse_failures += 1
+                    print(
+                        '[Planner] Unparseable decision '
+                        f'({self.parse_failures}/{self.max_parse_failures}); '
+                        f'raw response starts: {content[:200]!r}',
+                        flush=True,
+                    )
+                    if self.agent_memory is not None:
+                        self.agent_memory.add(
+                            'planner_parse_failure',
+                            round=round_index,
+                            step=step_index,
+                            content=content[:2000],
+                            error=str(exc)[:500],
+                        )
+                    if self.parse_failures >= self.max_parse_failures:
+                        return {
+                            'done': False,
+                            'error': (
+                                'Planner returned output that is not a valid '
+                                f'decision JSON {self.parse_failures} times; '
+                                f'last response started with {content[:120]!r}'
+                            ),
+                            'rounds': round_index + 1,
+                            'steps': total_steps,
+                            'last_raw_response': content[:2000],
+                        }
+                    # Retry once with an explicit correction.  A plain retry
+                    # would reproduce the same output at temperature 0, so the
+                    # message has to change.
+                    try:
+                        reserve_api_call('planner_corrective_retry')
+                        content = await async_chat_text(
+                            self.client,
+                            model=self.model,
+                            messages=[
+                                {'role': 'user', 'content': prompt},
+                                {
+                                    'role': 'user',
+                                    'content': (
+                                        'Your previous reply was not a valid '
+                                        'decision JSON object.  Reply with ONLY '
+                                        'the JSON object: no prose, no '
+                                        'markdown fence, no thinking block.'
+                                    ),
+                                },
+                            ],
+                            max_tokens=planner_max_tokens(2048),
+                            temperature=0.0,
+                            top_p=0.95,
+                            extra=request_extra(),
+                        )
+                        decision = parse_first_json_object(content)
+                        self.parse_failures = 0
+                    except ApiBudgetExceeded as budget_exc:
+                        return {
+                            'done': False,
+                            'error': str(budget_exc),
+                            'rounds': round_index + 1,
+                            'steps': total_steps,
+                        }
+                    except Exception as retry_exc:  # noqa: BLE001
+                        return {
+                            'done': False,
+                            'error': (
+                                'Planner output was not a valid decision JSON '
+                                'and the corrective retry failed: '
+                                f'{type(retry_exc).__name__}: {retry_exc}'
+                            ),
+                            'rounds': round_index + 1,
+                            'steps': total_steps,
+                            'last_raw_response': content[:2000],
+                        }
 
                 if decision.get('thought'):
                     print(f"[Planner] Thought: {decision['thought']}", flush=True)
@@ -343,6 +557,39 @@ class PlannerLoop:
 
                 tool_name = decision.get('tool_name')
                 args = decision.get('args', {})
+                signature = (
+                    str(tool_name),
+                    json.dumps(args or {}, sort_keys=True, default=str),
+                )
+                repeat_count = self.call_signatures[signature]
+                if repeat_count >= 2:
+                    print(
+                        f'[Tool] Refusing repeat #{repeat_count + 1} of '
+                        f'{tool_name} with identical arguments.',
+                        flush=True,
+                    )
+                    result = {
+                        'error': 'repeated_call_refused',
+                        'tool_name': tool_name,
+                        'times_already_called': repeat_count,
+                        'message': (
+                            'This exact call has already been made '
+                            f'{repeat_count} times with the same arguments. '
+                            'Change the arguments (different frames, entity or '
+                            'window) or use a different tool.'
+                        ),
+                    }
+                    if self.agent_memory is not None:
+                        self.agent_memory.add(
+                            'tool_observation',
+                            round=round_index,
+                            step=step_index,
+                            tool_name=tool_name,
+                            args=args,
+                            result=result,
+                        )
+                    continue
+                self.call_signatures[signature] += 1
                 print(
                     f'[Tool] Executing {tool_name} with args={args}',
                     flush=True,
@@ -410,4 +657,6 @@ class PlannerLoop:
             ),
             'rounds': self.max_rounds,
             'steps': total_steps,
+            'steps_since_progress': self._steps_since_progress,
+            'progress_score': self._best_progress,
         }

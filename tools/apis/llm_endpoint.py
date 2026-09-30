@@ -1,39 +1,36 @@
-"""Role-based OpenAI-compatible endpoint configuration.
+"""Endpoint configuration for the planning agent.
 
-The agent talks to two logically different models:
+The agent is **planner-only**: it reads JSON state and decides which tool to
+call.  It never sees pixels, so it needs a text model and nothing else.  All
+perception is handled by dedicated models instead:
 
-``planner``
-    Text-only decisions: evidence planning, tool selection, JSON output.
-    The Planner never sees pixels, so a cheap text model is usually enough.
+* detection / segmentation: SAM3 (or GroundingDINO + SAM2)
+* 3D reconstruction: VGGT
+* metric scale: MoGe
 
-``vlm``
-    Vision calls: candidate checking (``verify_candidate``) and the optional
-    VLM detection fallback.  This role must be a vision-language model.
+That is why there is a single ``planner`` role.  There is deliberately no
+vision role: earlier revisions routed candidate checking to a VLM and the
+resulting calls were both expensive and redundant once SAM3 provided masks.
 
-Each role resolves its ``MODEL`` / ``BASE_URL`` / ``API_KEY`` from environment
-variables, trying the role-specific prefix first and then the legacy
-``AGENT_COT_REASONER_*`` single-model configuration, so existing ``API.txt``
-files keep working unchanged.
+``planner`` resolves ``MODEL`` / ``BASE_URL`` / ``API_KEY`` from the
+environment, preferring ``AGENT_PLANNER_*`` and falling back to the legacy
+``AGENT_COT_REASONER_*`` variables so existing ``API.txt`` files keep working.
 
 Example::
 
-    export AGENT_PLANNER_MODEL='qwen3-max'
+    export AGENT_PLANNER_MODEL='qwen3.7-plus'
     export AGENT_PLANNER_BASE_URL='https://dashscope.aliyuncs.com/compatible-mode/v1'
     export AGENT_PLANNER_API_KEY='sk-...'
-
-    export AGENT_VLM_MODEL='qwen3-vl-plus'
-    export AGENT_VLM_BASE_URL='https://dashscope.aliyuncs.com/compatible-mode/v1'
-    export AGENT_VLM_API_KEY='sk-...'
 """
 
 from dataclasses import dataclass
+import json
 import os
 from typing import Any, Dict, List, Optional
 
 
 ROLE_PREFIXES: Dict[str, List[str]] = {
     'planner': ['AGENT_PLANNER', 'AGENT_COT_REASONER', 'AGENT_CODE_GENERATOR'],
-    'vlm': ['AGENT_VLM', 'AGENT_COT_REASONER', 'AGENT_CODE_GENERATOR'],
 }
 
 # Some model aliases cold-start slowly (observed >90s on a first call),
@@ -79,7 +76,10 @@ def resolve_endpoint(role: str, required: bool = True) -> Optional[Endpoint]:
     """Resolve the endpoint for one role from the environment."""
     role = str(role).strip().lower()
     if role not in ROLE_PREFIXES:
-        raise ValueError(f'Unknown LLM role: {role!r}; expected one of {sorted(ROLE_PREFIXES)}')
+        raise ValueError(
+            f'Unknown LLM role: {role!r}; expected one of {sorted(ROLE_PREFIXES)}. '
+            'The agent is planner-only and has no vision role.'
+        )
 
     for prefix in ROLE_PREFIXES[role]:
         values = _read_env(prefix)
@@ -100,6 +100,44 @@ def resolve_endpoint(role: str, required: bool = True) -> Optional[Endpoint]:
         f'No complete configuration found for role {role!r}. '
         f'Set one of: {tried}.'
     )
+
+
+def request_extra() -> Dict[str, Any]:
+    """Extra request-body fields, from ``GCA_LLM_EXTRA_BODY`` (JSON object).
+
+    Needed for local Qwen3 servers: the hybrid Qwen3 checkpoints think by
+    default, which burns the planner's token budget and can truncate the JSON
+    decision.  Disable it with::
+
+        export GCA_LLM_EXTRA_BODY='{"chat_template_kwargs": {"enable_thinking": false}}'
+
+    Leaving it unset keeps the previous behaviour, so the cloud endpoint is
+    unaffected.
+    """
+    raw = (os.environ.get('GCA_LLM_EXTRA_BODY') or '').strip()
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f'GCA_LLM_EXTRA_BODY is not valid JSON ({exc}); '
+            f'got {raw[:160]!r}'
+        ) from exc
+    if not isinstance(value, dict):
+        raise ValueError('GCA_LLM_EXTRA_BODY must be a JSON object')
+    return value
+
+
+def planner_max_tokens(default: int = 2048) -> int:
+    raw = os.environ.get('GCA_PLANNER_MAX_TOKENS')
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f'GCA_PLANNER_MAX_TOKENS must be an integer, got {raw!r}')
+    return max(64, value)
 
 
 def create_sync_client(endpoint: Endpoint):
@@ -229,6 +267,12 @@ def _recover_kwargs(exc: Exception, model, messages, max_tokens, temperature, to
         else:
             degraded.pop('max_tokens', None)
         changed = True
+    # An endpoint that does not know an extra field (e.g. a cloud API that has
+    # no chat_template_kwargs) should still work.
+    for key in list((extra or {}).keys()):
+        if key in degraded and _is_param_error(exc, key):
+            degraded.pop(key, None)
+            changed = True
     return (degraded, changed)
 
 
@@ -286,6 +330,8 @@ __all__ = [
     'create_sync_client',
     'create_async_client',
     'extract_message_text',
+    'request_extra',
+    'planner_max_tokens',
     'async_chat_text',
     'chat_text',
 ]
