@@ -13,6 +13,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from workflow.constraints.executor import (  # noqa: E402
+    execute_operation,
     obb_extent,
     percentile_extent,
     relative_direction,
@@ -20,6 +21,7 @@ from workflow.constraints.executor import (  # noqa: E402
     surface_distance_m,
 )
 from workflow.constraints.pipeline import run_operation, save_constraint  # noqa: E402
+from workflow.constraints.runtime import default_bindings  # noqa: E402
 from workflow.constraints.task_constraints import compile_task_constraint  # noqa: E402
 from workflow.constraints.validator import (  # noqa: E402
     map_value_to_option,
@@ -169,6 +171,81 @@ def test_map_value_to_option_numeric():
     assert map_value_to_option(2.9, ['2.7 m', '3.0 m', '2.9 m']) == '2.9 m'
 
 
+def test_map_value_to_option_lettered():
+    """VSI-Bench direction options are lettered; the label must still map.
+
+    Regression: ``map_value_to_option('left', ['A. left', 'B. right'])``
+    returned None, so every direction question was rejected as
+    ``answer_not_mappable``.
+    """
+    assert map_value_to_option('left', ['A. left', 'B. right']) == 'A. left'
+    assert map_value_to_option('right', ['A. left', 'B. right']) == 'B. right'
+    assert map_value_to_option(
+        'left', ['A. back', 'B. right', 'C. left']
+    ) == 'C. left'
+    assert map_value_to_option(
+        'back', ['A. back', 'B. right', 'C. left']
+    ) == 'A. back'
+    # a label that is not on offer must not be forced onto an option
+    assert map_value_to_option('sideways', ['A. left', 'B. right']) is None
+    # passing an option straight through still works
+    assert map_value_to_option('B. right', ['A. left', 'B. right']) == 'B. right'
+
+
+def _direction(angle_deg, options):
+    import math
+
+    origin = np.tile([0.0, 0, 0], (40, 1))
+    forward = np.tile([0.0, 0, 1], (40, 1))
+    rad = math.radians(angle_deg)
+    target = np.tile([math.sin(rad), 0.0, math.cos(rad)], (40, 1))
+    constraint = _constraint('relative_direction', unit='option', options=options)
+    result = execute_operation(
+        constraint,
+        {
+            'points': {'origin': origin, 'forward': forward, 'target': target},
+            'bindings': {},
+            'options': options,
+        },
+        context={},
+    )
+    return result['value']
+
+
+def test_direction_sectors_for_compound_options():
+    """object_rel_direction_hard offers diagonals like "front-left"."""
+    hard = ['A. front-left', 'B. back-right', 'C. back-left', 'D. front-right']
+    # _direction returns the option payload; validate_result maps it onto the
+    # lettered option (covered by the integration test).
+    assert _direction(-30, hard) == 'front-left'
+    assert _direction(-150, hard) == 'back-left'
+    assert _direction(30, hard) == 'front-right'
+    assert _direction(150, hard) == 'back-right'
+
+
+def test_direction_medium_splits_back_at_135():
+    """The medium question states back starts at a 135 degree turn."""
+    medium = ['A. back', 'B. right', 'C. left']
+    assert _direction(120, medium) == 'right'
+    assert _direction(150, medium) == 'back'
+    assert _direction(-150, medium) == 'back'
+    assert _direction(-120, medium) == 'left'
+
+
+def test_direction_sectors_follow_the_answer_options():
+    # left/right questions have no "front"; the split is the sign of the angle
+    assert _direction(30, ['A. left', 'B. right']) == 'right'
+    assert _direction(-30, ['A. left', 'B. right']) == 'left'
+    # a back option exists: VSI-Bench defines it as a turn of at least 135
+    assert _direction(150, ['A. back', 'B. right', 'C. left']) == 'back'
+    assert _direction(30, ['A. back', 'B. right', 'C. left']) == 'right'
+    # with all four options the 45 degree front sector applies
+    four = ['A. front', 'B. back', 'C. left', 'D. right']
+    assert _direction(30, four) == 'front'
+    assert _direction(100, four) == 'right'
+    assert _direction(150, four) == 'back'
+
+
 # ------------------------------------------------------------------ compile
 def test_compile_task_constraint_direction():
     plan = {
@@ -191,6 +268,121 @@ def test_compile_task_constraint_direction():
     assert data['reference_frame']['origin_entity'] == 'sofa'
     assert data['reference_frame']['forward_entity'] == 'stove'
     assert data['reference_frame']['target_entity'] == 'chair'
+
+
+def test_default_bindings_category_role_uses_category_name():
+    """Counting binds to the category, not to one instance id.
+
+    Regression: using ``chair_00`` here made ``query_tracks(category=...)``
+    return nothing, so every count came out as 0.
+    """
+    plan = {
+        'question_id': 1,
+        'question_type': 'object_counting',
+        'question': 'How many chairs?',
+        'target_entities': ['chair'],
+        'reference_entities': [],
+        'options': [],
+    }
+    constraint = compile_task_constraint(plan).to_dict()
+    bindings = default_bindings(constraint)
+    assert bindings == {'category': 'chair'}, bindings
+
+
+def test_default_bindings_instance_role_uses_instance_id():
+    constraint = _constraint('surface_distance')
+    constraint['entities'] = [
+        {'role': 'entity_a', 'category': 'sofa'},
+        {'role': 'entity_b', 'category': 'stove'},
+    ]
+    assert default_bindings(constraint) == {
+        'entity_a': 'sofa_00',
+        'entity_b': 'stove_00',
+    }
+
+
+def test_count_instances_reads_tracks_from_inputs():
+    """Regression: tracks are a top-level input, not a point-cloud role."""
+    constraint = _constraint('count_instances', unit='count', frame_required=False)
+    tracks = [
+        {'track_id': 'chair_00', 'support': 3},
+        {'track_id': 'chair_01', 'support': 2},
+    ]
+    result = execute_operation(
+        constraint,
+        {'points': {}, 'bindings': {'category': 'chair'}, 'tracks': tracks},
+        context={},
+    )
+    assert result['value'] == 2, result
+    assert result['metrics']['track_count'] == 2
+    assert result['metrics']['track_count_unfiltered'] == 2
+
+
+def test_count_instances_flags_filtered_tracks():
+    constraint = _constraint('count_instances', unit='count', frame_required=False)
+    result = execute_operation(
+        constraint,
+        {
+            'points': {},
+            'bindings': {'category': 'chair'},
+            'tracks': [{'track_id': 'chair_00'}],
+            'tracks_all': [{'track_id': 'chair_00'}, {'track_id': 'chair_01'}],
+        },
+        context={},
+    )
+    assert result['value'] == 1
+    assert result['metrics']['track_count_unfiltered'] == 2
+    assert 'tracks_filtered' in result['quality_flags']
+
+
+def test_validate_operation_rejects_comma_joined_category():
+    """Regression: the Planner pasted two track ids into the category role.
+
+    ``{"category": "chair_00,chair_01"}`` produced zero tracks and therefore a
+    verified answer of 0.  It must be rejected up front.
+    """
+    constraint = _constraint('count_instances', unit='count', frame_required=False)
+    report = validate_operation(constraint, {
+        'entity_bindings': {'category': 'chair_00,chair_01'},
+        'available_object_ids': ['chair_00', 'chair_01'],
+        'available_categories': ['chair'],
+    })
+    assert report['valid'] is False, report
+    types = {e['error_type'] for e in report['errors']}
+    assert 'invalid_category_binding' in types, types
+    error = next(
+        e for e in report['errors'] if e['error_type'] == 'invalid_category_binding'
+    )
+    assert error['available_categories'] == ['chair']
+
+
+def test_validate_operation_rejects_unknown_category():
+    constraint = _constraint('count_instances', unit='count', frame_required=False)
+    report = validate_operation(constraint, {
+        'entity_bindings': {'category': 'elephant'},
+        'available_categories': ['chair', 'sofa'],
+    })
+    assert report['valid'] is False
+    assert {e['error_type'] for e in report['errors']} == {'invalid_category_binding'}
+
+
+def test_validate_operation_allows_plain_category_name():
+    constraint = _constraint('count_instances', unit='count', frame_required=False)
+    report = validate_operation(constraint, {
+        'entity_bindings': {'category': 'chair'},
+        'available_object_ids': ['chair_00'],
+        'available_categories': ['chair'],
+    })
+    assert report['valid'] is True, report
+
+
+def test_validate_operation_allows_category_role_binding():
+    constraint = _constraint('count_instances', unit='count', frame_required=False)
+    report = validate_operation(constraint, {
+        'entity_bindings': {'category': 'chair'},
+        'available_object_ids': ['chair_00', 'chair_01'],
+    })
+    assert report['valid'] is True, report
 
 
 # ---------------------------------------------------------------- pipeline

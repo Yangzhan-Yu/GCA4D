@@ -20,8 +20,13 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from entrypoints.run_vsibench_agent import make_done_validator, register_tools  # noqa: E402
-from tools.apis.four_d_memory import MemoryObject, open_vsibench_memory  # noqa: E402
+from tools.apis.four_d_memory import (  # noqa: E402
+    MemoryObject,
+    Observation,
+    open_vsibench_memory,
+)
 from workflow.agentic.tool_registry import ToolRegistry  # noqa: E402
+from evals.vsibench import VSIBench  # noqa: E402
 from workflow.constraints.pipeline import save_constraint  # noqa: E402
 from workflow.constraints.task_constraints import compile_task_constraint  # noqa: E402
 
@@ -57,6 +62,22 @@ def _build_scene(root: Path):
     store.upsert_object(MemoryObject(object_id='sofa_00', category='sofa'))
     store.upsert_object(MemoryObject(object_id='stove_00', category='stove'))
     store.upsert_object(MemoryObject(object_id='chair_00', category='chair'))
+    # Two chairs, each seen in two frames, so counting has real tracks to find.
+    # Regression coverage: counting used to return 0 because the 'category'
+    # role was bound to an instance id and 'tracks' was read from the wrong
+    # input dict.
+    for chair_id in ('chair_00', 'chair_01'):
+        store.upsert_object(MemoryObject(object_id=chair_id, category='chair'))
+        for index, frame_id in enumerate(('000900', '001080')):
+            store.add_observation(Observation(
+                observation_id=f'{chair_id}_{frame_id}',
+                object_id=chair_id,
+                frame_id=frame_id,
+                timestamp=float(index * 3),
+                confidence=0.9,
+                position_3d=[float(index) * 0.2, 0.0, 0.0],
+                metadata={'track_id': chair_id, 'point_count': 8000},
+            ))
     evidence_dir = scene_root / 'evidence'
     evidence_dir.mkdir(parents=True, exist_ok=True)
     (evidence_dir / 'metric_scale.json').write_text(
@@ -66,7 +87,8 @@ def _build_scene(root: Path):
     return store, scene_root, data_root
 
 
-def _context(store, scene_root, data_root, question_id, constraint):
+def _context(store, scene_root, data_root, question_id, constraint,
+             question_type='object_abs_distance'):
     return {
         'repo_root': Path(__file__).resolve().parents[1],
         'data_root': data_root,
@@ -74,7 +96,7 @@ def _context(store, scene_root, data_root, question_id, constraint):
         'dataset': 'arkitscenes',
         'scene_name': 'scene1',
         'question_id': question_id,
-        'question_type': 'object_abs_distance',
+        'question_type': question_type,
         'scene_root': scene_root,
         'store': store,
         'device': 'cpu',
@@ -172,6 +194,101 @@ def main():
             if 'duplicate_instance_binding' not in types:
                 failures.append(f'missing duplicate_instance_binding error: {types}')
 
+        # Binding to an id without geometry must fail validation up front and
+        # list the usable instances.  Regression: the availability check
+        # compared the bindings against themselves, so it could never fail and
+        # this surfaced later as an opaque empty_pointcloud rejection.
+        bad_bind_plan = {
+            'question_id': 685,
+            'question_type': 'object_abs_distance',
+            'question': 'distance between the sofa and the stove?',
+            'target_entities': ['sofa', 'stove'],
+            'reference_entities': [],
+            'options': [],
+        }
+        bad_bind_constraint = compile_task_constraint(bad_bind_plan).to_dict()
+        save_constraint(bad_bind_constraint, scene_root, 685)
+        bad_bind_context = _context(
+            store, scene_root, data_root, 685, bad_bind_constraint,
+        )
+        bad_bind_report = registry.get('execute_operation').handler(
+            context=bad_bind_context,
+            bindings={'entity_a': 'sofa_07', 'entity_b': 'stove_07'},
+        )
+        if bad_bind_report.get('status') != 'rejected':
+            failures.append(
+                f'binding to a geometry-less instance should be rejected: '
+                f'{bad_bind_report}'
+            )
+        else:
+            pre_errors = bad_bind_report['operation_validation']['errors']
+            pre_types = {error['error_type'] for error in pre_errors}
+            if 'entity_not_bound' not in pre_types:
+                failures.append(f'expected entity_not_bound, got {pre_types}')
+            if not any(
+                error.get('available_instances') for error in pre_errors
+            ):
+                failures.append(
+                    'the error must list available_instances so the Planner can '
+                    f'rebind: {pre_errors}'
+                )
+
+        # counting must find the two chair tracks and report 2, not 0
+        count_plan = {
+            'question_id': 683,
+            'question_type': 'object_counting',
+            'question': 'How many chair(s) are in this room?',
+            'target_entities': ['chair'],
+            'reference_entities': [],
+            'options': [],
+        }
+        count_constraint = compile_task_constraint(count_plan).to_dict()
+        save_constraint(count_constraint, scene_root, 683)
+        count_context = _context(
+            store, scene_root, data_root, 683, count_constraint,
+            question_type='object_counting',
+        )
+        count_report = registry.get('execute_operation').handler(context=count_context)
+        if count_report.get('status') != 'valid':
+            failures.append(f'count_instances failed: {count_report}')
+        else:
+            counted = count_report['result']['value']
+            if counted != 2:
+                failures.append(
+                    f'expected count 2, got {counted} '
+                    f"(metrics={count_report['result']['metrics']})"
+                )
+            if count_report['result']['entity_bindings'].get('category') != 'chair':
+                failures.append(
+                    'category role must bind to the category name: '
+                    f"{count_report['result']['entity_bindings']}"
+                )
+            count_op_id = count_report['operation_id']
+            count_done = make_done_validator(count_context)({
+                'done': True,
+                'final_answer': '2',
+                'operation_result_id': count_op_id,
+            })
+            if not count_done.get('accepted') or count_done.get('final_answer') != '2':
+                failures.append(f'counting answer not accepted: {count_done}')
+
+        # The exact binding the local model produced must be rejected before
+        # execution instead of silently counting 0.
+        bad_cat = registry.get('execute_operation').handler(
+            context=count_context,
+            bindings={'category': 'chair_00,chair_01'},
+        )
+        if bad_cat.get('status') != 'rejected':
+            failures.append(
+                f'comma-joined category binding should be rejected: {bad_cat}'
+            )
+        else:
+            errs = bad_cat['operation_validation']['errors']
+            if 'invalid_category_binding' not in {
+                e['error_type'] for e in errs
+            }:
+                failures.append(f'expected invalid_category_binding: {errs}')
+
         # relative direction over three bound instances
         dir_plan = {
             'question_id': 681,
@@ -197,21 +314,56 @@ def main():
             if label != 'left':
                 failures.append(f'expected left, got {label}')
 
-        # An answer that is not in the option set must be rejected.
+        # When only front/back are offered, a lateral target folds into the
+        # nearer sector instead of being rejected - the question must still be
+        # answerable with one of its own options.
+        fold_plan = dict(dir_plan)
+        fold_plan['question_id'] = 682
+        fold_plan['options'] = ['front', 'back']
+        fold_constraint = compile_task_constraint(fold_plan).to_dict()
+        save_constraint(fold_constraint, scene_root, 682)
+        fold_context = _context(store, scene_root, data_root, 682, fold_constraint)
+        fold_report = registry.get('execute_operation').handler(context=fold_context)
+        if fold_report.get('status') != 'valid':
+            failures.append(f'front/back folding should be answerable: {fold_report}')
+        elif fold_report['result']['value'] not in ('front', 'back'):
+            failures.append(
+                f"folded label must be one of the options, got "
+                f"{fold_report['result']['value']!r}"
+            )
+
+        # An option set with no direction word at all cannot be mapped and
+        # must be rejected rather than guessed.
         bad_plan = dict(dir_plan)
-        bad_plan['question_id'] = 682
-        bad_plan['options'] = ['front', 'back']
+        bad_plan['question_id'] = 684
+        bad_plan['options'] = ['A. yes', 'B. no']
         bad_constraint = compile_task_constraint(bad_plan).to_dict()
-        save_constraint(bad_constraint, scene_root, 682)
-        bad_context = _context(store, scene_root, data_root, 682, bad_constraint)
+        save_constraint(bad_constraint, scene_root, 684)
+        bad_context = _context(store, scene_root, data_root, 684, bad_constraint)
         bad_report = registry.get('execute_operation').handler(context=bad_context)
         if bad_report.get('status') != 'rejected':
-            failures.append(f'out-of-option answer should be rejected: {bad_report}')
+            failures.append(f'unmappable answer should be rejected: {bad_report}')
         elif 'answer_not_mappable' not in {
             error['error_type']
             for error in bad_report.get('result_validation', {}).get('errors', [])
         }:
             failures.append(f'expected answer_not_mappable: {bad_report}')
+
+
+        # The mapped multiple-choice answer must survive the official scorer,
+        # which splits on the first space and strips the trailing dot.
+        scorer = VSIBench._extract_mca_answer
+        for option, expected_letter in (
+            ('A. left', 'a'),
+            ('B. right', 'b'),
+            ('C. left', 'c'),
+        ):
+            got = scorer(option)
+            if got != expected_letter:
+                failures.append(
+                    f'official scorer maps {option!r} -> {got!r}, expected '
+                    f'{expected_letter!r}'
+                )
 
     if failures:
         print('FAIL')

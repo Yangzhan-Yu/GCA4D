@@ -484,9 +484,9 @@ B—E 使用相同基础模型、感知模块和固定几何工具。所有组�
 | 计算后检查 `validate_result` | `workflow/constraints/validator.py` | 检查数值有限性、单位、是否落在答案选项中（`answer_not_mappable`）、阻塞性质量标记、结果稳定性 |
 | 来源与版本 | `workflow/constraints/pipeline.py` | `geometry_version` 由点云文件指纹导出；`coordinate_frame_id` 记录为 `vggt_world_q<id>`；结果携带 `input_evidence_ids` |
 | 问题级目录隔离 | `workflow/constraints/pipeline.py` | `<scene_root>/questions/<question_id>/` 下保存 `task_constraint.json`、`entity_bindings.json`、`operation_results.json`、`repair_log.jsonl` |
-| 定向修复 | `validator.py` + `pipeline.py` | 每个 `error_type` 映射到具体补证据动作，并写入 `repair_log.jsonl` |
+| 定向修复（基础设施） | `validator.py` + `pipeline.py` + `planner_loop.py` | 每个 `error_type` 映射到具体补证据动作写入 `repair_log.jsonl`；`done` 被驳回时把结构化错误回灌给 Planner |
 | 最终回答来自验证结果 | `entrypoints/run_vsibench_agent.py` → `make_done_validator` | `done=true` 必须引用已验证的 `operation_result_id`；只有一个已验证结果时自动采用该结果，`final_answer` 由验证值生成 |
-| Planner 只做决策 | `entrypoints/run_vsibench_agent.py` | 新增 `get_task_constraint`、`bind_constraint_entities`、`validate_operation`、`execute_operation`、`validate_result` 五个工具，全部由 Qwen 决定调用 |
+| Planner 只做决策 | `entrypoints/run_vsibench_agent.py` | 新增 `get_task_constraint`、`bind_constraint_entities`、`validate_operation`、`execute_operation`、`validate_result` 五个工具，全部由 Planner 决定调用。Agent 为 **planner-only**：不调用任何视觉语言模型 |
 | 第一轮关闭生成工具 | `--allow-tool-generation`（默认关闭） | 核心实验固定工具集；关闭时 prompt 不再提供 `create_tool`/`repair_tool` |
 | 参考答案隔离 | `planner_plan` 剔除 `ground_truth` | 约束编译只使用问题、类型、选项 |
 
@@ -502,8 +502,9 @@ CUDA_VISIBLE_DEVICES=0 python -m entrypoints.run_vsibench_agent \
 
 新增（可选）参数：`--allow-tool-generation`。
 
-Planner 与 VLM 现在可分开配置（`AGENT_PLANNER_*` / `AGENT_VLM_*`，未配置时回退到
-`AGENT_COT_REASONER_*`）。详见 `GCA_model_switching_guide.md` 与 `API.txt.example`。
+Agent 为 planner-only：只配置 `AGENT_PLANNER_*`（未配置时回退到
+`AGENT_COT_REASONER_*`），不调用任何视觉语言模型；感知走 SAM3 / SAM2 /
+VGGT / GroundingDINO。详见 `GCA_model_switching_guide.md` 与 `API.txt.example`。
 
 每题产物：
 
@@ -527,10 +528,35 @@ python tests/test_agent_constraint_integration.py           # 工具链端到端
 
 覆盖：方向四象限、退化方向、已知最近表面距离、长度估计、重复实例绑定、缺失 metric scale、过期几何版本、未绑定角色、阻塞式质量标记、选项外答案、约束编译、工具注册、`done` 门控。
 
-### A.4 尚未实现（后续阶段）
+### A.4 阶段进度对照（对应第十二节）
 
-- `room_area` / `route_turns` 目前只有占位执行分支，未接入房间区域证据。
-- 坐标系一致性目前按“同一问题、同一 VGGT 世界系”校验，尚未支持相机系与物体自身系的显式变换链。
-- 方向判定的左右符号采用 GCA 物体坐标系约定（`+Y` 向下）；需在开发集上用少量场景标定后冻结。
-- 未参与开发的场景上的泛化实验、拒答率与成本消融尚未开展。
-- `evals/vsibench.py` 尚未按分题型输出拒答率与错误类型分布。
+| 阶段 | 状态 | 已完成 | 缺口 |
+| --- | --- | --- | --- |
+| 阶段 1 建立可靠实验基础 | 🟡 大部分完成 | 问题级目录隔离；`ground_truth` 隔离；固定工具集（`--allow-tool-generation` 默认关闭）；API 调用次数记录 | **统一批量评估未实现**：`evals/vsibench.py` 仍是旧 GCA 评测，不驱动 agentic 入口；`scripts/run_vsibench_type_smoke.sh` 只是循环跑题，不是评测器。成本只记调用次数，未记 token |
+| 阶段 2 方向与距离约束 | 🟢 代码完成，**未在真实数据上验证** | 实体角色绑定、参考系构造、几何版本与单位检查、固定几何运算、答案提交验证；验收要求的错误用例均有单测 | 未用真实题跑通「合法计算能通过」这一半验收；方向左右符号未在真实 VGGT 世界系上标定 |
+| 阶段 3 定向修复 | 🟡 基础设施完成，策略与验收未做 | `error_type` → `suggested_actions` 映射；`repair_log.jsonl`；`done` 驳回后回灌错误 | 三种修复（实例歧义／几何不连通／结果不稳定）未做成显式策略；未与同预算通用重试做 A/B |
+| 阶段 4 扩展题型与正式评估 | 🔴 早期 | `first_visible_order`、`object_extent`、`count_instances` 已实现 | `room_area`、`route_turns` 仅占位；无分题型统计、无拒答率、无成本消融 |
+
+**当前所处位置：阶段 2 的代码已完成，卡在阶段 2 的验收实验上。**
+第十二节的第一个判断标准（固定证据下程序约束能否改善方向和距离题）尚未测量。
+
+### A.5 计划之外的工程改动
+
+以下不在原方案阶段划分内，但为执行方案提供了基础：
+
+- **感知替换**：检测+分割从 `GroundingDINO + SAM2` 换为 SAM3（一次前向同时出框和 mask），
+  以子进程方式在独立环境（torch≥2.7）运行，`--detector sam3`；SAM2 改为懒加载。
+- **模型角色收敛**：删除 `AGENT_VLM_*` 角色，移除 `verify_candidate` 工具、
+  `--detector vlm`、`count_entities_in_video` 的 VLM 路径。Agent 只配置 `AGENT_PLANNER_*`。
+- 上述改动共引入 4 个测试文件（34 项检查）：`tests/test_executable_constraints.py`、
+  `tests/test_llm_endpoint.py`、`tests/test_agent_constraint_integration.py`、
+  `tests/test_sam3_batch_plumbing.py`。
+
+### A.6 尚未实现（后续阶段）
+
+- 统一批量评估与分题型统计（含拒答率、错误类型分布、token 成本）——**阶段 1 的剩余项，也是阶段 2 验收的前置**。
+- 真实数据上的方向符号标定（`+Y` 向下约定需在开发集上确认后冻结）。
+- 坐标系一致性目前只按「同一问题、同一 VGGT 世界系」校验，尚无相机系与物体自身系的显式变换链。
+- 定向修复的显式策略模块与同预算 A/B 对照。
+- `room_area` / `route_turns` 接入真实房间区域证据（现为占位分支）。
+- 未参与开发的场景上的泛化实验。

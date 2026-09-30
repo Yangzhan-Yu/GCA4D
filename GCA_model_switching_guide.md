@@ -4,81 +4,46 @@
 相关代码：`tools/apis/llm_endpoint.py`、`entrypoints/run_vsibench_agent.py`、
 `entrypoints/collect_vsibench_evidence.py`、`workflow/agentic/planner_loop.py`
 
-## 1. 为什么要拆成两个角色
+## 1. 只有 Planner 一个角色
 
-原实现只有一个模型（`AGENT_COT_REASONER_*`），Planner 和所有视觉调用共用它。
-Qwen3-VL-235B-A22B-Thinking 因此承担了它并不需要承担的工作。
+**Agent 只负责推理。** 它读 JSON 状态、选工具、输出决策，**从来不接触图像**，
+所以只需要一个文本模型。
 
-现在拆成两个逻辑角色：
+感知全部由专用模型承担：
 
-| 角色 | 环境变量前缀 | 是否需要视觉 | 用途 |
-| --- | --- | --- | --- |
-| `planner` | `AGENT_PLANNER_*` | 否 | 证据规划、工具选择、输出 JSON 决策 |
-| `vlm` | `AGENT_VLM_*` | 是 | `verify_candidate` 候选框检查、`--detector vlm` 检测回退、`count_entities_in_video` 的 VLM 路径 |
+| 环节 | 模型 |
+|---|---|
+| 检测 + 分割 | SAM3（或 GroundingDINO + SAM2） |
+| 3D 重建 | VGGT |
+| metric scale | MoGe |
+| 计数 / 尺寸 / 距离 | 由 3D track 和点云几何计算 |
 
-**Planner 完全不看像素。** 它只看到 JSON 形式的场景状态、约束、工具列表和工具返回值。
-所以 Planner 可以是任意一个 OpenAI 兼容的纯文本模型，不需要 VL 能力。
+因此配置里只有一个角色：
 
-视觉部分在现在的默认链路里已经很少：
+| 角色 | 环境变量前缀 | 是否需要视觉 |
+| --- | --- | --- |
+| `planner` | `AGENT_PLANNER_*` | 否 |
 
-- 检测用 GroundingDINO / SAM3；
-- 分割用 SAM2；
-- 3D 用 VGGT，尺度用 MoGe；
-- Qwen 只在 `verify_candidate` 检查少量可疑 track，以及显式开启时才做多帧计数。
-
-所以 `vlm` 角色可以用比 235B 小得多的模型。
+> **历史说明**：早期版本还有一个 `vlm` 角色（`AGENT_VLM_*`），用来做
+> `verify_candidate` 候选框检查、`--detector vlm` 检测回退和
+> `count_entities_in_video` 的 VLM 计数。这三处都已删除：
+> `verify_candidate` 工具不存在了，`--detector` 只支持 `grounding_dino` 和
+> `sam3`，计数只走 3D track。`llm_endpoint` 也不再认识 `vlm` 角色，
+> 误用会直接报错。
 
 ## 2. 配置方式
 
-`AGENT_PLANNER_*` 和 `AGENT_VLM_*` 各自需要 `MODEL` / `BASE_URL` / `API_KEY`
-三个变量同时存在才算有效。优先级：
+`AGENT_PLANNER_*` 需要 `MODEL` / `BASE_URL` / `API_KEY` 三个变量同时存在。
+优先级：
 
 ```
 planner:  AGENT_PLANNER_*  ->  AGENT_COT_REASONER_*  ->  AGENT_CODE_GENERATOR_*
-vlm:      AGENT_VLM_*      ->  AGENT_COT_REASONER_*  ->  AGENT_CODE_GENERATOR_*
 ```
 
-即：
+即：不配置 `AGENT_PLANNER_*` 就沿用 `AGENT_COT_REASONER_*`；
+只配一半（例如漏了 API key）会自动回退并在启动日志里打印实际来源。
 
-- **不配置新变量** → 行为与现在完全一致，两个角色都用 `AGENT_COT_REASONER_*`；
-- **只配置 `AGENT_PLANNER_*`** → Planner 换成新模型，视觉仍用旧模型；
-- **某个新角色变量只写了一半**（例如漏了 API key）→ 自动回退到 `AGENT_COT_REASONER_*`，
-  并在启动日志里打印实际生效的来源。
-
-模板见仓库根目录 `API.txt.example`。
-
-### 只换 Planner（最省钱的改法）
-
-在 `API.txt` 里追加：
-
-```bash
-export AGENT_PLANNER_MODEL='qwen3-max'
-export AGENT_PLANNER_BASE_URL='https://dashscope.aliyuncs.com/compatible-mode/v1'
-export AGENT_PLANNER_API_KEY='sk-...'
-```
-
-保留原来的 `AGENT_COT_REASONER_*` 给视觉用。
-
-### 两个角色都换
-
-```bash
-export AGENT_PLANNER_MODEL='qwen3-max'
-export AGENT_PLANNER_BASE_URL='...'
-export AGENT_PLANNER_API_KEY='sk-...'
-
-export AGENT_VLM_MODEL='qwen3-vl-plus'
-export AGENT_VLM_BASE_URL='...'
-export AGENT_VLM_API_KEY='sk-...'
-```
-
-启动日志会打印：
-
-```
-[Agent] Planner endpoint: {"role": "planner", "source": "AGENT_PLANNER_*", "model": "qwen3-max", ...}
-[Agent] VLM endpoint    : {"role": "vlm", "source": "AGENT_VLM_*", "model": "qwen3-vl-plus", ...}
-```
-
-API key 只显示末四位，不会完整写入日志或 `agent_result.json`。
+模板见仓库根目录 `API.txt.example`。当前用的是 `qwen3.7-plus`。
 
 ## 3. 兼容性与自动降级
 
@@ -120,13 +85,12 @@ Planner 的任务是「读 JSON 状态、选工具、输出固定 schema 的 JSO
 | --- | --- | --- |
 | 国内 API（百炼兼容模式） | `qwen-flash`、`qwen-plus` | 最便宜，先测 JSON 稳定性 |
 | 国内 API（推理更强） | `qwen3-max`、`deepseek-v3` 系列、`glm-4.5` | 工具选择更稳，单价仍远低于 235B-Thinking |
-| 本项目当前选择 | Planner=`qwen3.7-plus`，VLM=`qwen3-vl-plus` | 见 `API.txt` |
+| 本项目当前选择 | Planner=`qwen3.7-plus`（文本模型） | 见 `API.txt` |
 | 本地 vLLM | `Qwen/Qwen3-32B` 等 | 零边际成本；`scripts/launch_agent.sh` 已支持 `BASE_URL='vllm'` 路径 |
-| 视觉角色 | `qwen3-vl-plus`、`qwen3-vl-30b-a3b` | 只在候选框检查时调用，成本占比低 |
 
 建议的验证顺序：
 
-1. 固定 `vlm` 不变，只用新 Planner 跑 2~3 道方向题 + 距离题；
+1. 用新 Planner 跑 2~3 道方向题 + 距离题；
 2. 检查 `agent_result.json` 里的 `steps`、`api_budget.used`、`verification` 是否正常；
 3. 确认 JSON 决策稳定后，再扩大题型。
 

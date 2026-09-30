@@ -9,7 +9,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tools.apis.llm_endpoint import (  # noqa: E402
+    ROLE_PREFIXES,
     _recover_kwargs,
+    planner_max_tokens,
+    request_extra,
     async_chat_text,
     chat_text,
     extract_message_text,
@@ -33,13 +36,13 @@ def _legacy():
     })
 
 
-def test_legacy_config_serves_both_roles():
+def test_legacy_config_serves_planner():
     _clear()
     _legacy()
     try:
-        assert resolve_endpoint('planner').model == 'legacy-model'
-        assert resolve_endpoint('vlm').model == 'legacy-model'
-        assert resolve_endpoint('planner').prefix == 'AGENT_COT_REASONER'
+        endpoint = resolve_endpoint('planner')
+        assert endpoint.model == 'legacy-model'
+        assert endpoint.prefix == 'AGENT_COT_REASONER'
     finally:
         _clear()
 
@@ -54,8 +57,76 @@ def test_role_specific_overrides_legacy():
     })
     try:
         assert resolve_endpoint('planner').model == 'cheap-text-model'
-        # VLM keeps the legacy/vision model.
-        assert resolve_endpoint('vlm').model == 'legacy-model'
+        assert resolve_endpoint('planner').prefix == 'AGENT_PLANNER'
+    finally:
+        _clear()
+
+
+def test_request_extra_reads_env_json():
+    saved = os.environ.pop('GCA_LLM_EXTRA_BODY', None)
+    try:
+        assert request_extra() == {}
+        os.environ['GCA_LLM_EXTRA_BODY'] = (
+            '{"chat_template_kwargs": {"enable_thinking": false}}'
+        )
+        assert request_extra() == {
+            'chat_template_kwargs': {'enable_thinking': False}
+        }
+        os.environ['GCA_LLM_EXTRA_BODY'] = 'not json'
+        try:
+            request_extra()
+        except ValueError as exc:
+            assert 'not valid JSON' in str(exc)
+        else:
+            raise AssertionError('bad JSON should raise')
+    finally:
+        os.environ.pop('GCA_LLM_EXTRA_BODY', None)
+        if saved is not None:
+            os.environ['GCA_LLM_EXTRA_BODY'] = saved
+
+
+def test_planner_max_tokens_default_and_override():
+    saved = os.environ.pop('GCA_PLANNER_MAX_TOKENS', None)
+    try:
+        assert planner_max_tokens(2048) == 2048
+        os.environ['GCA_PLANNER_MAX_TOKENS'] = '8192'
+        assert planner_max_tokens(2048) == 8192
+        os.environ['GCA_PLANNER_MAX_TOKENS'] = '1'
+        assert planner_max_tokens(2048) == 64
+    finally:
+        os.environ.pop('GCA_PLANNER_MAX_TOKENS', None)
+        if saved is not None:
+            os.environ['GCA_PLANNER_MAX_TOKENS'] = saved
+
+
+def test_unsupported_extra_key_is_dropped():
+    """A cloud endpoint with no chat_template_kwargs must still work."""
+    exc = Exception("BadRequestError: Unsupported parameter: chat_template_kwargs")
+    kwargs, changed = _recover_kwargs(
+        exc, 'm', [{'role': 'user', 'content': 'x'}], 100, 0.0, 0.95,
+        {'chat_template_kwargs': {'enable_thinking': False}},
+    )
+    assert changed
+    assert 'chat_template_kwargs' not in kwargs
+
+
+def test_vlm_role_is_removed():
+    """The agent is planner-only; there must be no vision role."""
+    _clear()
+    _legacy()
+    os.environ.update({
+        'AGENT_VLM_MODEL': 'some-vl-model',
+        'AGENT_VLM_BASE_URL': 'https://vlm/v1',
+        'AGENT_VLM_API_KEY': 'sk-vlm-0000',
+    })
+    try:
+        assert 'vlm' not in ROLE_PREFIXES
+        try:
+            resolve_endpoint('vlm')
+        except ValueError as exc:
+            assert 'planner-only' in str(exc)
+        else:
+            raise AssertionError('the vlm role should no longer resolve')
     finally:
         _clear()
 
